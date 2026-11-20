@@ -56,6 +56,7 @@ import io.github.shaonialife.carptocar.input.TouchRouter
 import io.github.shaonialife.carptocar.launcher.VirtualLauncher
 import io.github.shaonialife.carptocar.launcher.settings.AppOrientationCompat
 import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
+import io.github.shaonialife.carptocar.launcher.settings.NowPlayingTextSourcePrefs
 import io.github.shaonialife.carptocar.media.MediaSessionFallback
 import io.github.shaonialife.carptocar.media.MediaSessionsState
 import io.github.shaonialife.carptocar.media.NotificationAccess
@@ -870,14 +871,17 @@ object SessionController {
     /**
      * 合并两个歌名数据源，构造 iAP2 0x5001 载荷。
      *
-     * 优先系统媒体会话（覆盖第三方播放器 + CarLife 内置播放器的绝大多数场景），
-     * 读不到再退回 CarLife 0x10035 推来的媒体信息；两者皆无返回 null（不响应）。
+     * **歌名 / 艺术家名的数据源由 [NowPlayingTextSourcePrefs] 决定**（fork 开关）：
+     *  - CarLife 模式：取车机侧 0x10035 推来的媒体信息。小米 HyperOS 上 CarWith
+     *    会抢占系统媒体会话，此时 CarLife 自己的元数据更可靠。
+     *  - MediaSession 模式（原版行为）：优先系统媒体会话，读不到再退回 CarLife。
      *
-     * **唯一的例外是 CarLife 的逐行歌词**：iAP2 的 NowPlayingUpdate 没有歌词字段，
-     * 歌词只能顶替 title 逐行滚动。但它不能无条件抢（会把荣耀音乐那种「播放器自己
-     * 把歌词写进 MediaSession title」的显示打断，表现为标题一秒来回跳），
-     * 所以交给 [NowPlayingSourcePolicy] 判三条门：确实是歌词行 / CarLife 还在推 /
-     * 两边仍是同一首歌。
+     * 无论哪种模式，**封面、专辑名、播放状态、进度都走原有路径**：封面始终由
+     * [encodeArtwork] 从 `MediaSessionsState.nowPlaying?.art` 读取，开关不碰它。
+     *
+     * MediaSession 模式下仍保留 CarLife 逐行歌词仲裁：iAP2 的 NowPlayingUpdate 没有
+     * 歌词字段，歌词只能顶替 title 逐行滚动，由 [NowPlayingSourcePolicy] 判三条门。
+     * CarLife 模式下歌词行走 [carLifeNowPlaying] 相同的归一化口径（画家取真实歌曲那条）。
      *
      * [includeArtwork]=false 时不声明封面编号：**蓝牙 iAP2 链路还没有文件传输实现**，
      * 声明了编号却不传图，车机会留着封面位一直等（或反复重试同一个 id）。
@@ -887,20 +891,38 @@ object SessionController {
         val carLifeLatest = CarLifeHijack.latestMediaInfo
         val carLifeBase = CarLifeHijack.latestSongMediaInfo
         if (session != null && session.title != null) {
-            val lyricTakeover =
-                carLifeLatest != null &&
-                    NowPlayingSourcePolicy.shouldShowCarLifeLyric(
-                        nowMillis = android.os.SystemClock.uptimeMillis(),
-                        lastMediaInfoAtMillis = CarLifeHijack.latestMediaInfoAtMillis,
-                        latest = carLifeLatest,
-                        base = carLifeBase,
-                        sessionTitle = session.title,
-                        sessionArtist = session.artist,
-                    )
-            if (lyricTakeover) return carLifeNowPlaying(carLifeLatest, carLifeBase, includeArtwork)
+            val useCarLifeText =
+                appContext?.let { NowPlayingTextSourcePrefs.current(it).isCarLife } == true
+            if (!useCarLifeText) {
+                val lyricTakeover =
+                    carLifeLatest != null &&
+                        NowPlayingSourcePolicy.shouldShowCarLifeLyric(
+                            nowMillis = android.os.SystemClock.uptimeMillis(),
+                            lastMediaInfoAtMillis = CarLifeHijack.latestMediaInfoAtMillis,
+                            latest = carLifeLatest,
+                            base = carLifeBase,
+                            sessionTitle = session.title,
+                            sessionArtist = session.artist,
+                        )
+                if (lyricTakeover) return carLifeNowPlaying(carLifeLatest, carLifeBase, includeArtwork)
+            }
+            // CarLife 模式：歌词行只借 song 当标题，画家取「最近一条非歌词行」的真实歌曲；
+            // 与 carLifeNowPlaying 同口径，避免车机画家栏出现 "<album>-<artist>" 拼接串。
+            val carLifeText =
+                if (useCarLifeText && carLifeLatest != null) {
+                    val textBase = if (LyricLines.isLyricLine(carLifeLatest)) carLifeBase else null
+                    val title = carLifeLatest.song.takeIf { it.isNotBlank() }
+                    val artist =
+                        (textBase?.artist ?: carLifeLatest.artist).takeIf { it.isNotBlank() }
+                    if (title != null) title to artist else null
+                } else {
+                    null
+                }
             return CarPlayNowPlaying(
-                title = session.title,
-                artist = session.artist,
+                // CarLife 没推歌名时回退到 MediaSession，车机不会出现空白标题。
+                // artist 为 null 时同样回退，避免「CarLife 歌名 + 系统画家」错配。
+                title = carLifeText?.first ?: session.title,
+                artist = carLifeText?.second ?: session.artist,
                 album = null, // MediaSession 未单独暴露专辑名，这里留空
                 durationMs = session.durationMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                 status =

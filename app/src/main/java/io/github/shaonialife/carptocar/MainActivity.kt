@@ -51,6 +51,7 @@ import io.github.shaonialife.carptocar.launcher.settings.AutoConnectPrefs
 import io.github.shaonialife.carptocar.launcher.settings.DevModePrefs
 import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
 import io.github.shaonialife.carptocar.launcher.settings.KeepAliveMediaSessionPrefs
+import io.github.shaonialife.carptocar.launcher.settings.NowPlayingTextSourcePrefs
 import io.github.shaonialife.carptocar.legal.DisclaimerDialog
 import io.github.shaonialife.carptocar.legal.DisclaimerPrefs
 import io.github.shaonialife.carptocar.legal.needsDisclaimerAtLaunch
@@ -1297,6 +1298,31 @@ class MainActivity : AppCompatActivity() {
             KeepAliveMediaSessionPrefs.setEnabled(this, checked)
             renderKeepAliveMediaSessionNote(checked)
             log("MEDIASESSION: 保活媒体会话已${if (checked) "开启" else "关闭"}（数秒内生效）")
+        }
+
+        // 歌名 / 艺术家名来源（fork 专属）：开 = CarLife 0x10035，关 = 系统 MediaSession。
+        // 只影响 0x5001 的 title/artist；封面/专辑/进度/状态仍走原路径，不随开关变化。
+        val switchNowPlayingTextSource =
+            findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.switchNowPlayingTextSource)
+        val nowPlayingTextSourceNote = findViewById<TextView>(R.id.nowPlayingTextSourceNote)
+        fun renderNowPlayingTextSourceNote(carLife: Boolean) {
+            nowPlayingTextSourceNote.text =
+                if (carLife) {
+                    "CarLife：歌名/艺术家取 0x10035；封面仍读系统媒体会话"
+                } else {
+                    "系统媒体会话：歌名/艺术家读 MediaSession（原版行为）"
+                }
+        }
+        switchNowPlayingTextSource.isChecked = NowPlayingTextSourcePrefs.current(this).isCarLife
+        renderNowPlayingTextSourceNote(switchNowPlayingTextSource.isChecked)
+        switchNowPlayingTextSource.setOnCheckedChangeListener { _, checked ->
+            NowPlayingTextSourcePrefs.set(
+                this,
+                if (checked) NowPlayingTextSourcePrefs.Source.CARLIFE
+                else NowPlayingTextSourcePrefs.Source.MEDIA_SESSION,
+            )
+            renderNowPlayingTextSourceNote(checked)
+            log("NOWPLAYING: 歌名来源切换为 ${if (checked) "CarLife" else "系统媒体会话"}（下一次 0x5001 生效）")
         }
 
         // 本机蓝牙地址：Honor/MagicOS 等机型把 MAC 全面脱敏（连 adb shell 都读不到），

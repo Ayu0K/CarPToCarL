@@ -679,6 +679,52 @@
                         app:track="@drawable/sw_track" />
                 </LinearLayout>
 
+                <!-- 歌名 / 艺术家名的数据源（fork 专属开关）：
+                     开 = CarLife 0x10035（默认，绕开小米 CarWith 抢占系统媒体会话）
+                     关 = 系统 MediaSession（原版行为）。封面读取不受影响。 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:minHeight="56dp"
+                    android:orientation="horizontal"
+                    android:paddingTop="4dp"
+                    android:paddingBottom="4dp">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="54dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="歌名来源：CarLife / 系统媒体会话"
+                            android:textColor="@color/m3_on_surface"
+                            android:textSize="13.5sp" />
+
+                        <TextView
+                            android:id="@+id/nowPlayingTextSourceNote"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="开启：取 CarLife 媒体信息；关闭：读系统 MediaSession"
+                            android:textColor="@color/m3_on_var"
+                            android:textSize="11.5sp" />
+                    </LinearLayout>
+
+                    <androidx.appcompat.widget.SwitchCompat
+                        xmlns:app="http://schemas.android.com/apk/res-auto"
+                        android:id="@+id/switchNowPlayingTextSource"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:thumb="@drawable/sw_thumb"
+                        app:track="@drawable/sw_track" />
+                </LinearLayout>
+
                 <!-- 本机蓝牙地址：接收端（WinPlay 等）按它做设备过滤，厂商脱敏时必须手填 -->
                 <LinearLayout
                     android:layout_width="match_parent"
