@@ -6839,6 +6839,17 @@ object SessionController {
                                 // RECORD 成功 = 会话活着。此刻丢弃报文缓冲：用户要的是
                                 // 「连不上」的现场，正常连接不需要快照（省空间也省导出体积）。
                                 SessionTrace.markLinked()
+                                // fork 专属（对齐 mcarplay 流程）：AirPlay 会话 RECORD 成功、
+                                // 车机分辨率已拿到之后才自动拉起 CarWith——让 CarWith 按真实
+                                // 车机画布开始 CarLife 连接并监听七口，本项目的 7240 守候线程
+                                // 随后照常接管。开关/节流/结果分级见 CarLifeHijack。
+                                // firstRecordOk = RECORD 成功（mcarplay 的硬门槛）；
+                                // host != null = 有车机会话、分辨率已就绪。
+                                if (firstRecordOk && host != null) {
+                                    appContext?.let { ctx ->
+                                        CarLifeHijack.maybeAutoLaunchCarWith(ctx) { line -> appendLog(line) }
+                                    }
+                                }
                                 if (host != null) {
                                     // CarLife 本地劫持是**唯一**画面来源（2026-10-24 用户要求
                                     // 移除 CarPToCarL 自己的隐形屏画面）：手机原生 CarLife+ 的

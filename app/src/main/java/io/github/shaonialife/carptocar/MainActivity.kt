@@ -1334,7 +1334,7 @@ class MainActivity : AppCompatActivity() {
         fun renderAutoLaunchCarWithNote(checked: Boolean) {
             autoLaunchCarWithNote.text =
                 if (checked) {
-                    "已开启：7240 未监听时自动拉起 CarWith 进入 CarLife 连接" +
+                    "已开启：车机会话建立后自动拉起 CarWith 进入 CarLife 连接" +
                         (if (AutoLaunchCarWithPrefs.defaultEnabled()) "（小米默认）" else "（非小米默认关闭，你已手动开启）")
                 } else {
                     "已关闭：不自动拉起（请在 CarWith 里手动点「无线连接」）"
@@ -1345,7 +1345,7 @@ class MainActivity : AppCompatActivity() {
         switchAutoLaunchCarWith.setOnCheckedChangeListener { _, checked ->
             AutoLaunchCarWithPrefs.setEnabled(this, checked)
             renderAutoLaunchCarWithNote(checked)
-            log("CARWITH: 自动拉起已${if (checked) "开启" else "关闭"}（守候线程下一次轮询生效）")
+            log("CARWITH: 自动拉起已${if (checked) "开启" else "关闭"}（下次车机会话建立时生效）")
         }
 
         // 本机蓝牙地址：Honor/MagicOS 等机型把 MAC 全面脱敏（连 adb shell 都读不到），
