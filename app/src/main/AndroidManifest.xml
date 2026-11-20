@@ -59,6 +59,9 @@
     <queries>
         <package android:name="com.autonavi.amapauto" />
         <package android:name="com.autonavi.minimap" />
+        <!-- 自动拉起 CarWith 进入 CarLife 连接（fork 专属）：Android 11+ 包可见性 -->
+        <package android:name="com.miui.carlink" />
+        <package android:name="com.baidu.carlife.xiaomi" />
         <!-- 应用桌面需要枚举全部可启动应用（Android 11+ 包可见性） -->
         <intent>
             <action android:name="android.intent.action.MAIN" />

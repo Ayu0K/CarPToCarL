@@ -1,7 +1,9 @@
 package io.github.shaonialife.carptocar.carlife
 
 import android.content.Context
+import android.os.SystemClock
 import io.github.shaonialife.carptocar.audio.AudioRatePreference
+import io.github.shaonialife.carptocar.launcher.settings.AutoLaunchCarWithPrefs
 import io.github.shaonialife.carptocar.media.MediaSessionsState
 import io.github.shaonialife.carptocar.video.FirstFramePolicy
 import io.github.shaonialife.carptocar.video.VideoSink
@@ -31,6 +33,14 @@ object CarLifeHijack {
 
     private const val PREFS = "settings"
     private const val KEY_ENABLED = "carlife_hijack_enabled"
+
+    /**
+     * 自动拉起 CarWith 的节流（fork 专属，移植自 mcarplay 的 COMPATIBLE 策略）。
+     * 7240 一直不监听时，每轮尝试有限次，且间隔递增，避免每 1.5 秒狂拉 CarWith。
+     * 端口一旦监听即重置计数；开关关闭则完全不拉起。
+     */
+    private const val MAX_CARWITH_LAUNCH_ATTEMPTS = 3
+    private const val CARWITH_LAUNCH_COOLDOWN_MS = 20_000L
 
     /** 向 CarLife 引擎申请的编码帧率（60 = 跟手，30 = 省电）。 */
     private const val KEY_FPS = "carlife_fps"
@@ -959,15 +969,43 @@ object CarLifeHijack {
     private fun workerLoop() {
         var announcedWait = false
         var restartArmed = false
+        // 自动拉起 CarWith 的节流状态：一次「守候周期」内最多拉 MAX 次，间隔冷却。
+        var carWithLaunchAttempts = 0
+        var lastCarWithLaunchAt = 0L
         while (running.get()) {
-            // 2026-10-25 回滚：**不再自动拉起** CarLife 引擎。
+            // 2026-10-25 回滚：**不再无条件自动拉起** CarLife 引擎。
             // 自动拉起（bindService / startForegroundService / CarlifeActivity）实测能让
-            // 引擎起来并监听 7240，但拿不到荣耀的画面源——引擎只会把「荣耀车联 Powered by
+            // 引擎起来并监听 7240，但在荣耀上拿不到真实画面——引擎只会把「荣耀车联 Powered by
             // MagicOS」欢迎页反复编码送过来（恒定 ~10KB 静止帧），车机侧表现为
-            // 「连接成功但长时间没画面」。真实画面必须由荣耀车联自己创建虚拟屏后才有，
-            // 所以改回：用户手动打开 CarLife+ 点「无线连接」，本线程只负责守候并接管。
+            // 「连接成功但长时间没画面」。真实画面必须由厂商车联自己创建虚拟屏后才有。
+            //
+            // fork 专属改动：小米 HyperOS 上 CarWith 的公开入口可用（mcarplay 已验证），
+            // 由 AutoLaunchCarWithPrefs 控制是否自动拉起；默认仅小米开启，荣耀/其它默认关闭。
+            // 无论拉起与否，本线程职责不变：守候 7240，端口一开即接管。
             if (!portListening(CarLifeProtocol.PORT_CMD)) {
                 hasVideo = false
+                val ctx = appContext
+                if (ctx != null && AutoLaunchCarWithPrefs.enabled(ctx) &&
+                    carWithLaunchAttempts < MAX_CARWITH_LAUNCH_ATTEMPTS
+                ) {
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastCarWithLaunchAt >= CARWITH_LAUNCH_COOLDOWN_MS) {
+                        lastCarWithLaunchAt = now
+                        carWithLaunchAttempts++
+                        val result = CarWithLauncher.requestPublicEntry(ctx)
+                        logSink?.invoke(
+                            "CARWITH: 自动拉起第 $carWithLaunchAttempts/$MAX_CARWITH_LAUNCH_ATTEMPTS 次" +
+                                " → ${CarWithLauncher.describe(result)}",
+                        )
+                        // 入口缺失（老版本/未安装）时退回设置页，让用户在原厂 UI 里点无线连接
+                        if (result == CarWithLauncher.EntryLaunchResult.MISSING) {
+                            val settingsResult = CarWithLauncher.requestSettings(ctx)
+                            logSink?.invoke(
+                                "CARWITH: 公开入口缺失，回退设置页 → ${CarWithLauncher.describe(settingsResult)}",
+                            )
+                        }
+                    }
+                }
                 if (!announcedWait) {
                     announcedWait = true
                     logSink?.invoke(
@@ -979,6 +1017,9 @@ object CarLifeHijack {
                 continue
             }
             announcedWait = false
+            // 端口已监听（引擎就绪）：重置拉起计数，供下次会话重新尝试
+            carWithLaunchAttempts = 0
+            lastCarWithLaunchAt = 0L
             val sink = CarLifeAudioSink(logSink ?: {})
             // 导航播报走 TTS 通道（9241）：独立 sink、不参与暂停丢弃，投给 101 AltAudio/default
             val naviSink =

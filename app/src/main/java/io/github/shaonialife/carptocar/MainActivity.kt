@@ -48,6 +48,7 @@ import io.github.shaonialife.carptocar.input.TouchRouter
 import io.github.shaonialife.carptocar.launcher.VirtualLauncher
 import io.github.shaonialife.carptocar.launcher.settings.AppOrientationCompat
 import io.github.shaonialife.carptocar.launcher.settings.AutoConnectPrefs
+import io.github.shaonialife.carptocar.launcher.settings.AutoLaunchCarWithPrefs
 import io.github.shaonialife.carptocar.launcher.settings.DevModePrefs
 import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
 import io.github.shaonialife.carptocar.launcher.settings.KeepAliveMediaSessionPrefs
@@ -1323,6 +1324,28 @@ class MainActivity : AppCompatActivity() {
             )
             renderNowPlayingTextSourceNote(checked)
             log("NOWPLAYING: 歌名来源切换为 ${if (checked) "CarLife" else "系统媒体会话"}（下一次 0x5001 生效）")
+        }
+
+        // 自动拉起 CarWith 进入 CarLife 连接（fork 专属）：小米默认开、其它默认关。
+        // 由 CarLifeHijack 守候线程在 7240 未监听时按节流策略拉起，关掉即完全不拉起。
+        val switchAutoLaunchCarWith =
+            findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.switchAutoLaunchCarWith)
+        val autoLaunchCarWithNote = findViewById<TextView>(R.id.autoLaunchCarWithNote)
+        fun renderAutoLaunchCarWithNote(checked: Boolean) {
+            autoLaunchCarWithNote.text =
+                if (checked) {
+                    "已开启：7240 未监听时自动拉起 CarWith 进入 CarLife 连接" +
+                        (if (AutoLaunchCarWithPrefs.defaultEnabled()) "（小米默认）" else "（非小米默认关闭，你已手动开启）")
+                } else {
+                    "已关闭：不自动拉起（请在 CarWith 里手动点「无线连接」）"
+                }
+        }
+        switchAutoLaunchCarWith.isChecked = AutoLaunchCarWithPrefs.enabled(this)
+        renderAutoLaunchCarWithNote(switchAutoLaunchCarWith.isChecked)
+        switchAutoLaunchCarWith.setOnCheckedChangeListener { _, checked ->
+            AutoLaunchCarWithPrefs.setEnabled(this, checked)
+            renderAutoLaunchCarWithNote(checked)
+            log("CARWITH: 自动拉起已${if (checked) "开启" else "关闭"}（守候线程下一次轮询生效）")
         }
 
         // 本机蓝牙地址：Honor/MagicOS 等机型把 MAC 全面脱敏（连 adb shell 都读不到），
