@@ -633,6 +633,52 @@
                         app:track="@drawable/sw_track" />
                 </LinearLayout>
 
+                <!-- 占位保活 MediaSession（fork 专属开关）：
+                     荣耀默认开（MagicOS 保活初衷），小米/OPPO 等默认关，
+                     避免 CarWith / Car+ 把本会话当成当前媒体源。 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:minHeight="56dp"
+                    android:orientation="horizontal"
+                    android:paddingTop="4dp"
+                    android:paddingBottom="4dp">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="54dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="保活媒体会话（MediaSession）"
+                            android:textColor="@color/m3_on_surface"
+                            android:textSize="13.5sp" />
+
+                        <TextView
+                            android:id="@+id/keepAliveMediaSessionNote"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="默认：荣耀开启 / 其它 ROM 关闭"
+                            android:textColor="@color/m3_on_var"
+                            android:textSize="11.5sp" />
+                    </LinearLayout>
+
+                    <androidx.appcompat.widget.SwitchCompat
+                        xmlns:app="http://schemas.android.com/apk/res-auto"
+                        android:id="@+id/switchKeepAliveMediaSession"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:thumb="@drawable/sw_thumb"
+                        app:track="@drawable/sw_track" />
+                </LinearLayout>
+
                 <!-- 本机蓝牙地址：接收端（WinPlay 等）按它做设备过滤，厂商脱敏时必须手填 -->
                 <LinearLayout
                     android:layout_width="match_parent"

@@ -15,6 +15,7 @@ import androidx.core.app.NotificationCompat
 import io.github.shaonialife.carptocar.MainActivity
 import io.github.shaonialife.carptocar.SessionController
 import io.github.shaonialife.carptocar.bt.CarIdleGuard
+import io.github.shaonialife.carptocar.launcher.settings.KeepAliveMediaSessionPrefs
 import io.github.shaonialife.carptocar.util.DebugFileLog
 
 /**
@@ -54,6 +55,15 @@ class CarPlayService : Service() {
      * （会话本身保持 active，重建要重新走系统侧登记，反而多一次抖动）。
      */
     private fun syncKeepAliveSession() {
+        // fork: 开关关闭时连"已发布的会话"一起撤掉。只跳过创建是不够的——
+        // 用户在连接中途关掉开关时，旧的 active 会话仍然会被车联枚举到。
+        if (!KeepAliveMediaSessionPrefs.enabled(this)) {
+            if (keepAliveSession != null || keepAlivePlaying != null) {
+                releaseKeepAliveSession()
+                fileLog("SVC: 保活 MediaSession 已按用户开关关闭（不再对外发布媒体会话）")
+            }
+            return
+        }
         val playing = SessionController.audioStreamingNow
         if (keepAlivePlaying == playing && keepAliveSession != null) return
         runCatching {
@@ -127,6 +137,9 @@ class CarPlayService : Service() {
      *
      * **必须被通知监听器忽略**：`MediaListenerService` 会遍历活跃会话找「正在播放」的那条，
      * 我们自己的会话混进去会让车机歌名变成 CarPToCarL 自己。那边已按包名过滤。
+     *
+     * fork 改动：是否发布这条会话由 [KeepAliveMediaSessionPrefs] 决定——荣耀默认开，
+     * 其它 ROM 默认关，用户可在首页开关覆盖；关闭时会话会被释放，不再进入车联枚举结果。
      */
     private var keepAliveSession: android.media.session.MediaSession? = null
 

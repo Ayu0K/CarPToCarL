@@ -52,7 +52,9 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "io.github.shaonialife.carptocar"
+        // fork 专属包名：与原作者版本共存。namespace 保持原值，R/构建产物内部引用不动；
+        // 只有 applicationId 决定系统安装身份，因此两个 APK 可同时安装。
+        applicationId = "io.github.shaonialife.carptocar.mediasessionswitch"
         minSdk = 31
         targetSdk = 34
         versionCode = appVersionCode
@@ -81,6 +83,7 @@ android {
         debug {
             // **不要加 applicationIdSuffix**：本项目 debug 包就是日常使用的包——
             // Shizuku 授权是按包名授予的，改包名会要求重新授权。
+            // fork 已经改的是 defaultConfig.applicationId，这里不再叠加后缀。
             versionNameSuffix = "-debug"
         }
     }

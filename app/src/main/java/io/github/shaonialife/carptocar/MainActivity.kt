@@ -50,6 +50,7 @@ import io.github.shaonialife.carptocar.launcher.settings.AppOrientationCompat
 import io.github.shaonialife.carptocar.launcher.settings.AutoConnectPrefs
 import io.github.shaonialife.carptocar.launcher.settings.DevModePrefs
 import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
+import io.github.shaonialife.carptocar.launcher.settings.KeepAliveMediaSessionPrefs
 import io.github.shaonialife.carptocar.legal.DisclaimerDialog
 import io.github.shaonialife.carptocar.legal.DisclaimerPrefs
 import io.github.shaonialife.carptocar.legal.needsDisclaimerAtLaunch
@@ -1273,6 +1274,29 @@ class MainActivity : AppCompatActivity() {
                 // 授权后由兼容模式看门狗在 30 秒内把占位记录挂上。
                 connectionPermissionLauncher.launch(missingForSwitch.toTypedArray())
             }
+        }
+
+        // 占位保活 MediaSession（fork 专属）：荣耀默认开、其它 ROM 默认关。
+        // 关掉后前台服务仍会每 3 秒同步一次，发现开关关闭就释放已发布会话；
+        // 不需要重启 App，下一次 tick 即生效。
+        val switchKeepAliveMediaSession =
+            findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.switchKeepAliveMediaSession)
+        val keepAliveMediaSessionNote = findViewById<TextView>(R.id.keepAliveMediaSessionNote)
+        fun renderKeepAliveMediaSessionNote(checked: Boolean) {
+            keepAliveMediaSessionNote.text =
+                if (checked) {
+                    "已开启：发布占位会话换取后台豁免" +
+                        (if (KeepAliveMediaSessionPrefs.defaultEnabled()) "（荣耀默认）" else "（非荣耀默认关闭，你已手动开启）")
+                } else {
+                    "已关闭：不发布占位会话，避免 CarWith / Car+ 媒体卡片被独占"
+                }
+        }
+        switchKeepAliveMediaSession.isChecked = KeepAliveMediaSessionPrefs.enabled(this)
+        renderKeepAliveMediaSessionNote(switchKeepAliveMediaSession.isChecked)
+        switchKeepAliveMediaSession.setOnCheckedChangeListener { _, checked ->
+            KeepAliveMediaSessionPrefs.setEnabled(this, checked)
+            renderKeepAliveMediaSessionNote(checked)
+            log("MEDIASESSION: 保活媒体会话已${if (checked) "开启" else "关闭"}（数秒内生效）")
         }
 
         // 本机蓝牙地址：Honor/MagicOS 等机型把 MAC 全面脱敏（连 adb shell 都读不到），
