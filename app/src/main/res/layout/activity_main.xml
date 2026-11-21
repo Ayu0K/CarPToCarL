@@ -679,9 +679,9 @@
                         app:track="@drawable/sw_track" />
                 </LinearLayout>
 
-                <!-- 歌名 / 艺术家名的数据源（fork 专属开关）：
-                     开 = CarLife 0x10035（默认，绕开小米 CarWith 抢占系统媒体会话）
-                     关 = 系统 MediaSession（原版行为）。封面读取不受影响。 -->
+                <!-- 启用 CarLife 媒体歌词（fork 专属开关）：
+                     开 = 标题/歌手从 CarLife 0x10035 读（歌词行即逐行歌词）；封面始终从系统 MediaSession 读
+                     关 = 标题/歌手/封面始终从系统 MediaSession 读真实值。 -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -701,7 +701,7 @@
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="歌名来源：CarLife / 系统媒体会话"
+                            android:text="启用Carlife媒体歌词"
                             android:textColor="@color/m3_on_surface"
                             android:textSize="13.5sp" />
 
@@ -710,7 +710,7 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="2dp"
-                            android:text="开启：取 CarLife 媒体信息；关闭：读系统 MediaSession"
+                            android:text="开启：标题/歌手取 CarLife 歌词；封面始终取系统媒体会话"
                             android:textColor="@color/m3_on_var"
                             android:textSize="11.5sp" />
                     </LinearLayout>

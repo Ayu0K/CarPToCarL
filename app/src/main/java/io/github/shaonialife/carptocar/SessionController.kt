@@ -44,7 +44,6 @@ import io.github.shaonialife.carptocar.iap2.Iap2NowPlaying
 import io.github.shaonialife.carptocar.iap2.Iap2SenderSession
 import io.github.shaonialife.carptocar.iap2.NmeaAssembler
 import io.github.shaonialife.carptocar.iap2.NmeaLocation
-import io.github.shaonialife.carptocar.iap2.NowPlayingSourcePolicy
 import io.github.shaonialife.carptocar.iap2.ReceiverProfile
 import io.github.shaonialife.carptocar.input.ConsumerKeys
 import io.github.shaonialife.carptocar.input.HidDescriptorSummary
@@ -700,17 +699,33 @@ object SessionController {
     }
 
     /**
+     * 当前 MediaSession 封面的去重键。
+     *
+     * 封面**始终**从 MediaSession 取，与「启用 Carlife 媒体歌词」开关无关；CarLife
+     * 只提供标题/歌手/专辑/时长等非封面信息。用位图身份做键，歌词行不会改键，
+     * 系统换图（新 Bitmap 实例）才会改键。
+     */
+    private fun mediaArtworkKey(): String? =
+        MediaSessionsState.nowPlaying?.let { ArtworkDedupe.key(it.title, it.artist, it.art) }
+
+    /**
      * 歌名变化：同时补推 WiFi 隧道（currentClient）与蓝牙链路（server/client）。
      *
      * 去重保护：部分播放器（荣耀音乐等）会把「逐行歌词」写进 MediaSession title，
      * 导致每秒多次内容变化、且同一行会因多触发源（1s 轮询 + 会话回调 + metadata 回调）
      * 重复 publish。这里按 title+artist 去重，只在真正切歌/切歌词行时推一次。
+     * **封面键单独参与**：CarLife 模式下文本来自 CarLife、封面来自 MediaSession，
+     * 系统换图但 CarLife 文本没变时也必须推一帧，否则歌换了图还停在上一首。
      */
     private fun pushNowPlayingAll() {
-        // 这里只要去重键（title|artist），不声明封面编号：真正的 0x5001 由各链路
-        // 各自的 provider 构造（隧道带封面、蓝牙不带），这里先编码一遍纯属浪费。
+        // 这里只要去重键，不声明封面编号：真正的 0x5001 由各链路的 provider 构造。
         val np = buildNowPlaying(includeArtwork = false) ?: return
-        val key = "${np.title}|${np.artist}"
+        val artKey = mediaArtworkKey().orEmpty()
+        if (artKey.isNotEmpty() && artKey != lastPushedArtworkKey) {
+            appendLog("ART: MediaSession 封面变更（$artKey）→ 触发 0x5001 重推")
+        }
+        lastPushedArtworkKey = artKey
+        val key = "${np.title}|${np.artist}|$artKey"
         if (key == lastPushedNowPlayingKey) return
         lastPushedNowPlayingKey = key
         currentClient?.pushNowPlaying()
@@ -718,8 +733,11 @@ object SessionController {
         bluetoothClient?.pushNowPlaying()
     }
 
-    /** 上次推送的 0x5001 内容键（title|artist），用于去重。 */
+    /** 上次推送的 0x5001 内容键（title|artist|封面键），用于去重。 */
     private var lastPushedNowPlayingKey: String? = null
+
+    /** 上次参与 0x5001 去重的 MediaSession 封面键（仅用于诊断日志）。 */
+    private var lastPushedArtworkKey: String? = null
 
     /**
      * 新一轮连接开始：清掉 0x5001 去重键。
@@ -731,6 +749,7 @@ object SessionController {
      */
     fun resetNowPlayingDedupe() {
         lastPushedNowPlayingKey = null
+        lastPushedArtworkKey = null
         // 封面同理：新会话是新的车机上下文，编号与缓存都得从头来（车机侧按 id 缓存，
         // 沿用旧 id 会让它直接用缓存、根本不来要图）。
         artworkKey = null
@@ -746,10 +765,10 @@ object SessionController {
     // ---- 封面（iAP2 session 12 文件传输）----
 
     /**
-     * 封面缓存键（`歌名|歌手`，CarLife 分支用 `专辑|歌手`）。
+     * 封面缓存键（MediaSession 位图身份，见 [ArtworkDedupe.key]）。
      *
-     * 同一首歌不重复取图/编码：一张 500×500 JPEG 要分 10~30 个块传过去，
-     * 每次补推 0x5001 都重传一遍等于拿封面去挤视频和音频的带宽。
+     * 封面**始终**取自系统媒体会话，CarLife 分支也用同一个键——歌词行不会改键，
+     * 系统换图（新 Bitmap 实例）才会改键并触发重新编码/换 id。
      */
     private var artworkKey: String? = null
 
@@ -780,13 +799,13 @@ object SessionController {
      * 必须由 [buildNowPlaying] 调用：它决定 0x5001 里要不要带
      * `media_item_artwork_file_transfer_identifier`。
      *
+     * 封面**只从 MediaSession 取**；CarLife 的 `albumArt` 一概不读取。去重键用
+     * [ArtworkDedupe.key]（系统封面位图身份），同 key 不重编码/不换 id；压缩后的
+     * 字节与上一张完全一致时也沿用旧 id，避免车机反复重取同一张图。
+     *
      * 加锁的理由：[buildNowPlaying] 会被三条线程调（iAP2 节拍、媒体事件、会话线程），
      * 编码本身只要几毫秒，但并发进来会重复编码、并且把 `artworkSeq` 自增两次
      * ——车机就会收到两个连续的 id，前一张图的传输半路被新的顶掉。
-     *
-     * **同一张图不换编号**（[ArtworkDedupe]）：歌词行走 [key] / [ArtworkDedupe.shouldReuseId]
-     * 两条闸挡住——否则每滚一行歌词就重新编码、重新排队一次 25KB 传输（2026-11-15
-     * 奥迪 MIB3 实测 2 分钟里 19 次 SETUP、车机 0 次 START）。
      */
     @Synchronized
     private fun ensureArtwork(key: String): Int? {
@@ -869,95 +888,76 @@ object SessionController {
     }
 
     /**
-     * 合并两个歌名数据源，构造 iAP2 0x5001 载荷。
+     * 构造 iAP2 0x5001 载荷。
      *
-     * **歌名 / 艺术家名的数据源由 [NowPlayingTextSourcePrefs] 决定**（fork 开关）：
-     *  - CarLife 模式：取车机侧 0x10035 推来的媒体信息。小米 HyperOS 上 CarWith
-     *    会抢占系统媒体会话，此时 CarLife 自己的元数据更可靠。
-     *  - MediaSession 模式（原版行为）：优先系统媒体会话，读不到再退回 CarLife。
+     * **歌名 / 艺术家名的数据源由 [NowPlayingTextSourcePrefs] 严格二选一**（fork 开关）：
+     *  - **开（启用 Carlife 媒体歌词）**：始终从车机侧 CarLife 0x10035 的
+     *    [CarLifeMediaInfo] 读取——标题取 `song`（歌词行即逐行歌词），歌手取原始
+     *    `artist`（歌词行为「歌名-歌手」格式）。不从系统媒体会话借任何字段，也不回退。
+     *  - **关（系统媒体会话）**：始终从系统 MediaSession 读取真实标题 / 真实歌手；
+     *    不接受 CarLife 歌词仲裁，也不回退到 CarLife。
      *
-     * 无论哪种模式，**封面、专辑名、播放状态、进度都走原有路径**：封面始终由
-     * [encodeArtwork] 从 `MediaSessionsState.nowPlaying?.art` 读取，开关不碰它。
-     *
-     * MediaSession 模式下仍保留 CarLife 逐行歌词仲裁：iAP2 的 NowPlayingUpdate 没有
-     * 歌词字段，歌词只能顶替 title 逐行滚动，由 [NowPlayingSourcePolicy] 判三条门。
-     * CarLife 模式下歌词行走 [carLifeNowPlaying] 相同的归一化口径（画家取真实歌曲那条）。
+     * **封面始终从系统 MediaSession（`MediaSessionsState.nowPlaying?.art`）获取**，与开关
+     * 无关；CarLife 只提供标题 / 歌手 / 专辑 / 时长等非封面信息，其 `albumArt` 一概不读。
+     * 这样封面走原本的位图身份去重与 iAP2 传输链路，不会因 CarLife 逐帧推图而换 id。
      *
      * [includeArtwork]=false 时不声明封面编号：**蓝牙 iAP2 链路还没有文件传输实现**，
      * 声明了编号却不传图，车机会留着封面位一直等（或反复重试同一个 id）。
      */
     private fun buildNowPlaying(includeArtwork: Boolean = true): CarPlayNowPlaying? {
-        val session = MediaSessionsState.nowPlaying
-        val carLifeLatest = CarLifeHijack.latestMediaInfo
-        val carLifeBase = CarLifeHijack.latestSongMediaInfo
-        if (session != null && session.title != null) {
-            val useCarLifeText =
-                appContext?.let { NowPlayingTextSourcePrefs.current(it).isCarLife } == true
-            if (!useCarLifeText) {
-                val lyricTakeover =
-                    carLifeLatest != null &&
-                        NowPlayingSourcePolicy.shouldShowCarLifeLyric(
-                            nowMillis = android.os.SystemClock.uptimeMillis(),
-                            lastMediaInfoAtMillis = CarLifeHijack.latestMediaInfoAtMillis,
-                            latest = carLifeLatest,
-                            base = carLifeBase,
-                            sessionTitle = session.title,
-                            sessionArtist = session.artist,
-                        )
-                if (lyricTakeover) return carLifeNowPlaying(carLifeLatest, carLifeBase, includeArtwork)
-            }
-            // CarLife 模式：歌词行只借 song 当标题，画家取「最近一条非歌词行」的真实歌曲；
-            // 与 carLifeNowPlaying 同口径，避免车机画家栏出现 "<album>-<artist>" 拼接串。
-            val carLifeText =
-                if (useCarLifeText && carLifeLatest != null) {
-                    val textBase = if (LyricLines.isLyricLine(carLifeLatest)) carLifeBase else null
-                    val title = carLifeLatest.song.takeIf { it.isNotBlank() }
-                    val artist =
-                        (textBase?.artist ?: carLifeLatest.artist).takeIf { it.isNotBlank() }
-                    if (title != null) title to artist else null
-                } else {
-                    null
-                }
-            return CarPlayNowPlaying(
-                // CarLife 没推歌名时回退到 MediaSession，车机不会出现空白标题。
-                // artist 为 null 时同样回退，避免「CarLife 歌名 + 系统画家」错配。
-                title = carLifeText?.first ?: session.title,
-                artist = carLifeText?.second ?: session.artist,
-                album = null, // MediaSession 未单独暴露专辑名，这里留空
-                durationMs = session.durationMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                status =
-                    if (session.playing) {
-                        Iap2NowPlaying.STATUS_PLAYING
-                    } else {
-                        Iap2NowPlaying.STATUS_PAUSED
-                    },
-                elapsedMs =
-                    session
-                        .displayPositionAt(android.os.SystemClock.elapsedRealtime())
-                        .coerceAtMost(Int.MAX_VALUE.toLong())
-                        .toInt(),
-                appName = session.pkg,
-                artworkId =
-                    if (includeArtwork && !Iap2ArtworkSupport.unsupported) {
-                        // 键按**图**算，不按 title 算：播放器把逐行歌词写进 title 时，
-                        // 拿 title 当键等于每句歌词换一张封面（见 [ArtworkDedupe]）。
-                        ensureArtwork(ArtworkDedupe.key(session.title, session.artist, session.art))
-                    } else {
-                        null
-                    },
+        val useCarLife =
+            appContext?.let { NowPlayingTextSourcePrefs.current(it).isCarLife } == true
+        if (useCarLife) {
+            // 开：始终从 CarLife 0x10035 读——标题=歌词(song)、歌手=原始「歌名-歌手」(artist)。
+            val info = CarLifeHijack.latestMediaInfo ?: return null
+            return carLifeNowPlaying(
+                info,
+                CarLifeHijack.latestSongMediaInfo,
+                includeArtwork,
             )
         }
-        val info = carLifeLatest ?: return null
-        return carLifeNowPlaying(info, carLifeBase, includeArtwork)
+        // 关：始终从系统媒体会话读真实标题 / 真实歌手，不掺 CarLife 歌词、不回退。
+        val session = MediaSessionsState.nowPlaying ?: return null
+        val title = session.title?.takeIf { it.isNotBlank() } ?: return null
+        return CarPlayNowPlaying(
+            title = title,
+            artist = session.artist?.takeIf { it.isNotBlank() },
+            album = null, // MediaSession 未单独暴露专辑名，这里留空
+            durationMs = session.durationMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            status =
+                if (session.playing) {
+                    Iap2NowPlaying.STATUS_PLAYING
+                } else {
+                    Iap2NowPlaying.STATUS_PAUSED
+                },
+            elapsedMs =
+                session
+                    .displayPositionAt(android.os.SystemClock.elapsedRealtime())
+                    .coerceAtMost(Int.MAX_VALUE.toLong())
+                    .toInt(),
+            appName = session.pkg,
+            artworkId =
+                if (includeArtwork && !Iap2ArtworkSupport.unsupported) {
+                    // 键按**图**算，不按 title 算：播放器把逐行歌词写进 title 时，
+                    // 拿 title 当键等于每句歌词换一张封面（见 [ArtworkDedupe]）。
+                    ensureArtwork(ArtworkDedupe.key(session.title, session.artist, session.art))
+                } else {
+                    null
+                },
+        )
     }
 
     /**
-     * CarLife 侧（0x10035）的 0x5001 载荷。
+     * CarLife 侧（0x10035）的 0x5001 载荷（开关「启用 Carlife 媒体歌词」打开时专用）。
      *
-     * 歌词行只借它的 `song` 当标题，**画家/专辑/时长一律取真实歌曲那条**——否则车机上
-     * 画家一栏会显示 `总有春风为你而来 (女版)-悠禾` 这种拼接串。
-     * 封面同理按「专辑|真实画家」归一化：歌词行共用一个键，`ensureArtwork` 直接命中，
-     * 不会每行重编码重传一遍（参考项目当年每行都重传 19.5KB）。
+     * **title = `info.song`（歌词行即逐行歌词）；artist = `info.artist` 原始值**——
+     * 歌词行的 artist 本身就是 CarLife 传来的「歌名-歌手」拼接格式，按用户要求原样推送，
+     * **不再归一化成真实歌手**（此前会把「总有春风为你而来 (女版)-悠禾」换成「悠禾」）。
+     *
+     * album / duration 仍取「最近一条非歌词行」的真实歌曲那条（歌词行 duration 常为 0）。
+     *
+     * **封面不从 CarLife 取**：CarLife 的 `albumArt` 一概忽略，封面始终走系统 MediaSession
+     * 的 `MediaSessionsState.nowPlaying?.art`，沿用原有位图身份去重与 iAP2 传输。
      */
     private fun carLifeNowPlaying(
         info: CarLifeMediaInfo,
@@ -966,13 +966,15 @@ object SessionController {
     ): CarPlayNowPlaying {
         val lyric = LyricLines.isLyricLine(info)
         val source = if (lyric) base else null
-        val artist = source?.artist ?: info.artist
-        val album = source?.album ?: info.album
+        // 推送给车机的歌手：CarLife 原始 artist（歌词行 = 「歌名-歌手」格式），不归一化。
+        val artist = info.artist
+        // 专辑/时长仍用真实歌曲那条，与歌名/歌手字段的选择解耦；封面完全不用 CarLife 数据。
+        val albumForArt = source?.album ?: info.album
         val duration = source?.duration?.takeIf { it > 0 } ?: info.duration
         return CarPlayNowPlaying(
             title = info.song.takeIf { it.isNotBlank() },
             artist = artist.takeIf { it.isNotBlank() },
-            album = album.takeIf { it.isNotBlank() },
+            album = albumForArt.takeIf { it.isNotBlank() },
             durationMs = duration,
             status = Iap2NowPlaying.STATUS_PLAYING, // CarLife 推歌名即视为播放中
             // 必须是真实位置：填 0 时车机「已播放」永远停在 0:00、进度条一动不动。
@@ -980,7 +982,8 @@ object SessionController {
             appName = info.source.takeIf { it.isNotBlank() },
             artworkId =
                 if (includeArtwork && !Iap2ArtworkSupport.unsupported) {
-                    ensureArtwork("$album|$artist")
+                    // 封面始终从 MediaSession 取；CarLife 只提供非封面信息。
+                    mediaArtworkKey()?.let { ensureArtwork(it) }
                 } else {
                     null
                 },

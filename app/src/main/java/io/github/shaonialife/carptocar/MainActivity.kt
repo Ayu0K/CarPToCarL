@@ -1301,17 +1301,17 @@ class MainActivity : AppCompatActivity() {
             log("MEDIASESSION: 保活媒体会话已${if (checked) "开启" else "关闭"}（数秒内生效）")
         }
 
-        // 歌名 / 艺术家名来源（fork 专属）：开 = CarLife 0x10035，关 = 系统 MediaSession。
-        // 只影响 0x5001 的 title/artist；封面/专辑/进度/状态仍走原路径，不随开关变化。
+        // 启用 CarLife 媒体歌词（fork 专属）：开 = 始终读 CarLife 0x10035，
+        // 关 = 始终读系统 MediaSession。两条源严格隔离，封面不随开关变化。
         val switchNowPlayingTextSource =
             findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.switchNowPlayingTextSource)
         val nowPlayingTextSourceNote = findViewById<TextView>(R.id.nowPlayingTextSourceNote)
         fun renderNowPlayingTextSourceNote(carLife: Boolean) {
             nowPlayingTextSourceNote.text =
                 if (carLife) {
-                    "CarLife：歌名/艺术家取 0x10035；封面仍读系统媒体会话"
+                    "开启：标题/歌手取 CarLife 歌词；封面始终取系统媒体会话"
                 } else {
-                    "系统媒体会话：歌名/艺术家读 MediaSession（原版行为）"
+                    "关闭：标题/歌手/封面固定读系统通知真实值，不受 CarLife 影响"
                 }
         }
         switchNowPlayingTextSource.isChecked = NowPlayingTextSourcePrefs.current(this).isCarLife
@@ -1323,7 +1323,7 @@ class MainActivity : AppCompatActivity() {
                 else NowPlayingTextSourcePrefs.Source.MEDIA_SESSION,
             )
             renderNowPlayingTextSourceNote(checked)
-            log("NOWPLAYING: 歌名来源切换为 ${if (checked) "CarLife" else "系统媒体会话"}（下一次 0x5001 生效）")
+            log("NOWPLAYING: 启用Carlife媒体歌词已${if (checked) "开启（始终读 CarLife）" else "关闭（始终读系统媒体会话）"}（下一次 0x5001 生效）")
         }
 
         // 自动拉起 CarWith 进入 CarLife 连接（fork 专属）：小米默认开、其它默认关。
