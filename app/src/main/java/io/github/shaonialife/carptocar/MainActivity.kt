@@ -1415,8 +1415,8 @@ class MainActivity : AppCompatActivity() {
                         report.blockingMissing.joinToString("、") { it.requirement.title } + "）"
                 }
             // 「一键获取」只列出**真能自动引导**的项（[PermissionRepair]）：运行时权限弹框、
-            // 开蓝牙/开 WLAN、位置服务、通知使用权、忽略电池优化。本机蓝牙地址、目标车机
-            // 这些设置项不算权限，不放进按钮里冒充。
+            // 开蓝牙/开 WLAN、位置服务、通知使用权、显示在其他应用上层、忽略电池优化。
+            // 本机蓝牙地址、目标车机这些设置项不算权限，不放进按钮里冒充。
             val repairPlan = PermissionRepair.plan(this)
             val actions =
                 buildList {
@@ -2091,6 +2091,40 @@ class MainActivity : AppCompatActivity() {
                 }
             },
         )
+
+        // 触摸域自适应（默认关）：上报坐标域比画面大时按观测上限线性映射。
+        // 即时生效——直接改 CarLifeHijack 的开关字段，不必重连；持久化走 DisplayPrefs。
+        val adaptiveTouchSwitch = findViewById<SwitchCompat>(R.id.switchAdaptiveTouch)
+        adaptiveTouchSwitch.isChecked = DisplayPrefs.adaptiveTouchDomain(ctx)
+        CarLifeHijack.adaptiveTouchDomain = adaptiveTouchSwitch.isChecked
+        adaptiveTouchSwitch.setOnCheckedChangeListener { _, checked ->
+            DisplayPrefs.setAdaptiveTouchDomain(ctx, checked)
+            CarLifeHijack.adaptiveTouchDomain = checked
+            snack(
+                if (checked) {
+                    "触摸域自适应已开启——下一笔触摸起按实测上报域换算（日志见「触控 ↓」行）"
+                } else {
+                    "触摸域自适应已关闭——坐标恢复原样透传"
+                },
+            )
+        }
+        // 车机占屏时保留视频流（实验，默认关）：车机借屏放转向/倒车影像时不再拆流，
+        // 归还后补关键帧 + 重武装 HID 即可恢复。即时生效——直接改静态开关字段，不必重连。
+        val keepScreenSwitch = findViewById<SwitchCompat>(R.id.switchKeepScreenStream)
+        keepScreenSwitch.isChecked = DisplayPrefs.keepScreenStreamOnTake(ctx)
+        io.github.shaonialife.carptocar.airplay.CarPlayResourceStreams.keepScreenStreamOnTake =
+            keepScreenSwitch.isChecked
+        keepScreenSwitch.setOnCheckedChangeListener { _, checked ->
+            DisplayPrefs.setKeepScreenStreamOnTake(ctx, checked)
+            io.github.shaonialife.carptocar.airplay.CarPlayResourceStreams.keepScreenStreamOnTake = checked
+            snack(
+                if (checked) {
+                    "已开启「车机占屏保留视频流」——不再 TEARDOWN，归还后补关键帧恢复（下一轮起算）"
+                } else {
+                    "已关闭——恢复旧行为（让屏即 TEARDOWN，归还后整套重建）"
+                },
+            )
+        }
     }
 
     private fun updateAudioTag() {

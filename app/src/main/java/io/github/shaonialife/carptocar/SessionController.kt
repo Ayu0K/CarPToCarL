@@ -66,6 +66,7 @@ import io.github.shaonialife.carptocar.net.CarPlayCtrlAdvertiser
 import io.github.shaonialife.carptocar.net.CarPlayServiceBrowser
 import io.github.shaonialife.carptocar.net.EndpointHosts
 import io.github.shaonialife.carptocar.net.HotspotHint
+import io.github.shaonialife.carptocar.net.NetworkMemory
 import io.github.shaonialife.carptocar.net.NetworkReusePolicy
 import io.github.shaonialife.carptocar.net.SilentJoinPolicy
 import io.github.shaonialife.carptocar.net.WifiCarPlayConnector
@@ -192,8 +193,10 @@ object SessionController {
      * `joinCarWifiSpecifier` 会一直失败）。配套开关是
      * `onCarPlayEndpoint(..., onCurrentWifi = true)`：告诉交接流程「网络已经绑好了，
      * 别再走加入热点那一段」。
+     *
+     * 值来自 [NetworkMemory]（那边用它判断「合成端点不能进复用记忆」），单一来源。
      */
-    private const val CURRENT_WIFI_LABEL = "(当前WiFi)"
+    private const val CURRENT_WIFI_LABEL = NetworkMemory.CURRENT_WIFI_LABEL
 
     /**
      * 等车机 ctrl 邀请的上限（事件驱动，收到即走）。
@@ -483,6 +486,9 @@ object SessionController {
         installAppStateBridge()
         installProtocolModules()
         startMediaWatchdog()
+        // 音频自愈：音频流被 stop 掉（发包失败/收尾没建回来）后自动重建，
+        // 不必等用户手动「重启一次」或整轮重连（2026-11-21 实车：断一次就永久没声音）
+        startAudioSelfHealWatchdog()
         // 监听器没被系统绑上时的兜底（荣耀常态）：自己枚举会话，
         // 媒体键直投不再依赖「服务是否被绑上」。
         MediaSessionFallback.start(context.applicationContext, ::appendLog)
@@ -1088,7 +1094,8 @@ object SessionController {
      * 未装配直接调本地函数；两路共用同一份实现，不会重复下发。
      *
      * 日志里的「已送达 / 未送达」只在 [CarLifeHijack.sendVoiceKey] 返回 false 时才有信息量，
-     * 它表示「socket 写失败」，不是「引擎收到了」——这台车机的硬键本来就没有回执。
+     * 它表示「socket 写失败」，不是「引擎收到了」——语音控制（0x10066）同样没有回执，
+     * 唯一的凭据是引擎自己回的 `65574 … 语音=1`（见 [CarLifeProtocol.Module]）。
      */
     private fun dispatchVoiceHardKey(keycode: Int) {
         val ok =
@@ -1102,8 +1109,9 @@ object SessionController {
                 sendVoiceHardKey(keycode)
             }
         appendLog(
-            "CARLIFE: 车机语音键 0x%02X → 0x68008 ".format(keycode) +
-                if (ok) "已送达" else "未送达（CarLife 未接管）",
+            "CARLIFE: 车机语音键 0x%02X → ".format(keycode) +
+                (if (keycode == CarLifeProtocol.HardKey.VR_STOP) "0x68008" else "0x10066") +
+                if (ok) " 已送达" else " 未送达（CarLife 未接管）",
         )
     }
 
@@ -2163,15 +2171,22 @@ object SessionController {
      * 2~4 分钟的连/断循环——守卫在工作，但用户看着像「蓝牙坏了」，所以日志里
      * 每次重断都写一行，便于事后区分「守卫在干活」与「真的在抖」。
      *
-     * 退出条件（任一命中）：用户断开、iAP2 会话建立（[BtSessionGate.sessionActive]）、
-     * 已经开始推流、或盯满 [AudioProfileGuardPolicy.MAX_MILLIS]。
+     * 退出条件（任一命中）：用户断开、**本轮 RFCOMM 已连入**、iAP2 bring-up、
+     * CarPlay 端点拿到、已经开始推流、或盯满 [AudioProfileGuardPolicy.MAX_MILLIS]。
+     *
+     * 2026-11-21 收紧：原先用 `iap2Ready`（完整 bring-up）作退出条件，别克卡在
+     * `0x4300` ACK 时它就一直不来——08:17 那轮连踢 6 次、跨 90 秒，而踢 HFP 会带
+     * ACL 一起断。改为「车机一连入 `…caff` 就停」（bmw134 的收敛结论），并用
+     * 本轮连入计数区分上一轮残留；RFCOMM 后另留 1 次上限兜竞态。
      *
      * 2026-11-19 收紧：会话一旦激活就**连一轮都不跑**（以前是先起线程、下一拍才发
      * 现该停，这中间仍可能把刚连上的 HFP/A2DP 掐一次），断开动作前还会二次确认，
      * 收工时把「因为哪个条件停的」写进日志——见 [AudioGuardGate]。
      */
     private fun startAudioProfileGuard() {
-        guardStopReason()?.let { reason ->
+        // 快照必须在起线程前取：否则上一轮残留的 RFCOMM 会被误判成本轮连入。
+        val connectCountAtStart = BtSessionGate.controlConnectCount
+        guardStopReason(connectCountAtStart)?.let { reason ->
             appendLog(
                 "BT-GUARD: $reason——会话已激活，" +
                     "本轮不再盯音频配置文件（不主动断开 HFP/A2DP）",
@@ -2184,6 +2199,7 @@ object SessionController {
             try {
                 if (ctx == null) return@Thread
                 val appCtx = ctx.applicationContext
+                val controlConnected = { BtSessionGate.controlConnectCount > connectCountAtStart }
                 val drops =
                     BtProfiles.guardAudioProfiles(
                         appCtx,
@@ -2191,9 +2207,10 @@ object SessionController {
                             BtSessionGate.activePeerAddress
                                 ?: TargetDevicePrefs.get(appCtx)?.address
                         },
-                        shouldStop = { guardStopReason() != null },
+                        shouldStop = { guardStopReason(connectCountAtStart) != null },
                         onEvent = { line -> appendLog(line) },
-                        stopLabel = { guardStopReason() ?: "会话状态已变化" },
+                        stopLabel = { guardStopReason(connectCountAtStart) ?: "会话状态已变化" },
+                        controlConnected = controlConnected,
                     )
                 appendLog("BT-GUARD: 守卫线程结束（共断开 $drops 次）")
             } catch (error: Throwable) {
@@ -2208,14 +2225,19 @@ object SessionController {
     }
 
     /**
-     * 音频配置守卫该不该收工、因为哪个条件（`null` = 继续盯）。判定在 [AudioGuardGate]。
+     * 守卫收工原因。
+     *
+     * [connectCountAtStart] = 本轮守卫启动时 RFCOMM 连入计数；之后计数变大才说明是
+     * **本轮**车机连进来了，不能用上一轮残留的连接状态误判（那会让新一轮守卫根本不启动）。
      */
-    private fun guardStopReason(): String? =
+    private fun guardStopReason(connectCountAtStart: Long = -1): String? =
         AudioGuardGate.stopReason(
             sessionWanted = sessionWanted,
             iap2Ready = BtSessionGate.iap2Ready,
             sessionActive = BtSessionGate.sessionActive,
             streaming = isStreaming(),
+            controlConnected =
+                connectCountAtStart >= 0 && BtSessionGate.controlConnectCount > connectCountAtStart,
         )
 
     /**
@@ -4146,34 +4168,74 @@ object SessionController {
         setup: AirPlayClient.SetupInfo,
         initial: VideoSender?,
         factory: (AirPlayClient.ScreenStreamInfo) -> VideoSender,
-    ) = CarPlayResourceStreams(
+    ): CarPlayResourceStreams = CarPlayResourceStreams(
         client = client,
         sessionKey = secret,
         displayUuid = setup.displayUuid,
         audioIntent = audioIntent,
         initialSender = initial,
         createSender = factory,
-        onScreenPaused = {
+        onScreenPaused = { streamKept ->
             synchronized(sessionLifecycleLock) {
                 if (currentClient === client) {
-                    CarLifeHijack.detach()
+                    // 「这次给屏 → 被抢」之间我们到底送出去几帧、活了多久：车机抢屏若恒定落在
+                    // 首帧后 100~300ms，就是它一收到我们的帧就出问题，与用户操作无关。
+                    val frames = CarLifeHijack.framesDelivered - videoSessionFrameBase
+                    val aliveMs =
+                        if (screenResumedAtMs == 0L) {
+                            -1L
+                        } else {
+                            android.os.SystemClock.elapsedRealtime() - screenResumedAtMs
+                        }
+                    // 实验开关：保留视频流时**不能 detach**——采集端一连断开，编码器就没帧可送，
+                    // 「不拆流」也就名存实亡。
+                    if (!streamKept) CarLifeHijack.detach()
                     ScreenDimmer.setSessionActive(false)
-                    phaseHint = "车机暂时持有主屏资源，等待显示请求或归还"
-                    appendLog("RESOURCE: 主屏暂由车机持有；保留控制会话，等待 requestUI 或资源归还")
+                    phaseHint =
+                        if (streamKept) {
+                            "车机暂时持有主屏资源——视频流保留，归还后立即恢复"
+                        } else {
+                            "车机暂时持有主屏资源，等待显示请求或归还"
+                        }
+                    appendLog(
+                        if (streamKept) {
+                            "RESOURCE: 主屏暂由车机持有；视频流保留（实验开关，未 TEARDOWN）" +
+                                " · 本次已送 $frames 帧" +
+                                if (aliveMs >= 0) " / 已存活 ${aliveMs}ms" else ""
+                        } else {
+                            "RESOURCE: 主屏暂由车机持有；保留控制会话，等待 requestUI 或资源归还" +
+                                " · 本次送流 $frames 帧" +
+                                if (aliveMs >= 0) " / 存活 ${aliveMs}ms" else ""
+                        },
+                    )
                 }
             }
         },
-        onScreenResumed = { sender ->
+        onScreenResumed = { sender, soft ->
             synchronized(sessionLifecycleLock) {
                 if (currentClient !== client || client.cancelled || !client.phoneOwnsScreen) {
                     false
                 } else {
                     videoSender = sender
                     videoSessionFrameBase = CarLifeHijack.framesDelivered
-                    CarLifeHijack.attach(sender, ::appendLog)
+                    screenResumedAtMs = android.os.SystemClock.elapsedRealtime()
+                    if (soft) {
+                        // 沿用现有流：不重新 SETUP，但车机会把 HID 输入模式复位（触摸静默失效），
+                        // 所以必须重发 hidSetInputMode；画面靠补关键帧让解码器立刻出图。
+                        hidDeclaredUuids.forEach { uuid ->
+                            runCatching { client.sendHidSetInputMode(uuid, 0) }
+                        }
+                        sender.requestKeyFrame()
+                        appendLog(
+                            "RESOURCE: 主屏归还——沿用现有视频流（实验开关），补关键帧 + 重武装 HID" +
+                                "（${hidDeclaredUuids.size} 个设备）",
+                        )
+                    } else {
+                        CarLifeHijack.attach(sender, ::appendLog)
+                        appendLog("RESOURCE: 主屏归还，已重新 SETUP/RECORD 并恢复视频（音频所有权独立）")
+                    }
                     ScreenDimmer.setSessionActive(true)
                     phaseHint = "主屏资源已归还，CarPlay 视频恢复"
-                    appendLog("RESOURCE: 主屏归还，已重新 SETUP/RECORD 并恢复视频（音频所有权独立）")
                     startCarlifeWaitNotice()
                     startFirstFrameGate()
                     startScreenHandoverGate(client)
@@ -4565,16 +4627,29 @@ object SessionController {
         audioRestartWorker.execute { restartAudioNow(reason) }
     }
 
-    private fun restartAudioNow(reason: String) {
+    /**
+     * 真正干活的重启（[requestAudioRestart] 与音频自愈共用）。
+     *
+     * @param resumePlayback 顺带恢复媒体播放。用户手动触发时为 true（三连击的语义就是
+     *   「我要声音回来」）；**自动自愈必须为 false**——用户可能自己按了暂停，
+     *   自动恢复播放属于「把用户没要的东西塞回去」。
+     * @return 是否「已经处理」（重建成功，或已挂起等车机归还主音频）；
+     *   false = 这条音频流没建起来，调用方（自愈看门狗）据此决定退避重试。
+     */
+    private fun restartAudioNow(
+        reason: String,
+        resumePlayback: Boolean = true,
+    ): Boolean {
         val client = currentClient
         if (client == null || client.cancelled || !client.controlSessionAlive) {
             appendLog("AUDIO: 重启音频（$reason）被忽略——当前没有在线的 CarPlay 会话")
             uiHintSink?.invoke("没有在线会话，无法重启音频")
-            return
+            return false
         }
-        audioSender?.restartPipeline(reason)
+        val sender = audioSender
+        val pipelineReset = audioSender?.restartPipeline(reason) ?: false
         navAudioSender?.restartPipeline(reason)
-        if (MediaSessionsState.nowPlaying?.playing != true) {
+        if (resumePlayback && MediaSessionsState.nowPlaying?.playing != true) {
             // 三连击的语义就是「我要声音回来」，所以这里无条件恢复一次播放；
             // 用户若本来就想暂停，自己再按一次暂停即可（比「重建完依然静音」可接受）。
             CarLifeHijack.resumeMediaFromCar("重启音频后恢复播放（$reason）")
@@ -4583,11 +4658,10 @@ object SessionController {
             pendingAudioRebuild = reason
             appendLog("AUDIO: 车机当前持有/借用主音频——先不抢，等它归还后再重建音频流（$reason）")
             uiHintSink?.invoke("音频已重置，等车机归还主音频后自动重建")
-            return
+            return true
         }
         pendingAudioRebuild = null
-        val sender = audioSender
-        if (sender != null && sender.isRunning) {
+        if (pipelineReset && sender != null && sender.isRunning) {
             val rebuilt = rebuildAudioChannel(reason)
             appendLog(
                 if (rebuilt) {
@@ -4597,10 +4671,11 @@ object SessionController {
                 },
             )
             uiHintSink?.invoke(if (rebuilt) "音频已重启" else "音频已重置（流重建失败，旧流仍在推）")
-            return
+            return rebuilt
         }
-        // 流根本没在推（引擎退出后没恢复、上一轮拆流没建回来）：这不是「重建」而是「补建」，
-        // 走与「资源取得」完全相同的路径，顺带把 RECORD 补上。
+        // 流根本没在推（引擎退出后没恢复、上一轮拆流没建回来、发包失败被 stop）：
+        // 这不是「重建」而是「补建」，走与「资源取得」完全相同的路径，顺带把 RECORD 补上。
+        appendLog("AUDIO: 发送端没在运行（$reason）→ 按补建处理：整条音频流重建")
         val context = appContext?.applicationContext
         val secret = currentSharedSecret
         val started =
@@ -4614,6 +4689,7 @@ object SessionController {
             },
         )
         uiHintSink?.invoke(if (started) "音频已重启" else "音频重启失败，详见日志")
+        return started
     }
 
     /**
@@ -4626,6 +4702,143 @@ object SessionController {
     private fun onRecordedAll() {
         audioSender?.onRecorded()
         navAudioSender?.onRecorded()
+    }
+
+    // ---- 音频自愈（2026-11-21）----
+
+    /** 自愈看门狗是否已启动（幂等，跟随进程而不是会话）。 */
+    private var audioSelfHealStarted = false
+
+    /** 连续「引擎在推 PCM、音频流已停」多久才动手（防抖，别让一次拆链收尾就触发重建）。 */
+    private const val AUDIO_HEAL_DEAD_MS = 3_000L
+
+    /** 每一轮最多重建几次；再失败就只提示用户（继续硬试只会 SETUP 风暴）。 */
+    private const val AUDIO_HEAL_MAX_ATTEMPTS = 5
+
+    /** 自愈看门狗节拍。 */
+    private const val AUDIO_HEAL_TICK_MS = 5_000L
+
+    /** 本轮自愈已尝试次数 / 下一次允许尝试的时刻（uptimeMillis）。 */
+    private var audioHealAttempts = 0
+    private var audioHealNextAt = 0L
+    private var audioHealGaveUp = false
+
+    /** 上一拍看到的丢弃计数（判断「还在持续丢」而不是「丢过就完了」）。 */
+    private var audioHealLastDropSeen = 0
+
+    /** 连续丢弃的开始时刻；0 = 当前没有在丢。 */
+    private var audioDeadSinceAt = 0L
+
+    /**
+     * 音频自愈看门狗：**音频流被 stop 掉之后，只要引擎还在推 PCM，就自动重建。**
+     *
+     * ## 为什么必须有（2026-11-21 实车日志）
+     *
+     * 17:27:14 与 17:37:14 各一次 `Message too long`（内核 `EMSGSIZE`），`AudioSender`
+     * 当场 `stop()` 整条音频通路。此后 10 分钟里引擎照常每 10 秒推 PCM、每 10 秒被丢弃，
+     * 日志喊了 60 遍「音频流已停」——**没有任何人接手**：
+     * 视频流的反复重协商（`type=110` TEARDOWN/SETUP）不带音频；
+     * 界面「重启一次」按钮在 `restartPipeline` 里被 `!running` 直接挡掉；
+     * 真正能重建的 RTSP SETUP 那一刻又被车机 reset 的控制通道拒成 400。
+     * 结果就是「画面正常、歌名在滚、就是没声音，必须重连」。用户要的是一个能自己好起来的东西。
+     *
+     * ## 判据为什么是这三个一起
+     *
+     * 1. `audioSender != null && !isRunning`——**建成过又停了**。`sender == null` 是
+     *    「本轮没要声音」（用户没勾音频），那是意图不是故障，绝不能自动重建；
+     * 2. `CarLifeHijack.audioDeadDrops` 还在涨——引擎真的在推 PCM（不是用户按了暂停、
+     *    也不是还没开始播）；连续涨满 [AUDIO_HEAL_DEAD_MS] 才算数，避免和收尾路径抢；
+     * 3. `client.phoneOwnsAudio`——车机借走主音频时抢建会把它的借用栈重置，
+     *    它归还时反而找不到自己的借用（既有路径会在归还后补做）。
+     *
+     * ## 退避
+     *
+     * 1 分钟 → 2 → 3 → 4 → 5 分钟，5 次失败后只打一行「请重启 App 或让车机重连」。
+     * 音频流一旦真的跑起来（`isRunning`）账本立刻清零——包括车机重连后新会话自带的流。
+     *
+     * 自愈走的恢复动作与用户手动「重启一次」完全一致（[restartAudioNow] 的补建分支），
+     * 唯一区别是**不恢复媒体播放**：用户可能自己按了暂停，自动把播放塞回去属于越权。
+     */
+    private fun startAudioSelfHealWatchdog() {
+        if (audioSelfHealStarted) return
+        audioSelfHealStarted = true
+        Thread({
+            while (true) {
+                try {
+                    Thread.sleep(AUDIO_HEAL_TICK_MS)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                runCatching { audioSelfHealTick() }
+                    .onFailure { appendLog("AUDIO: 音频自愈看门狗异常 - ${it.message}") }
+            }
+        }, "audio-self-heal").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun audioSelfHealTick() {
+        val sender = audioSender
+        // 音频在推 = 一切正常：账本清零（含「上一轮放弃」的标记，下次故障重新给机会）
+        if (sender != null && sender.isRunning) {
+            if (audioHealAttempts > 0 || audioHealGaveUp) {
+                appendLog("AUDIO: 音频流已恢复运行——自愈计账清零（此前尝试 $audioHealAttempts 次）")
+            }
+            audioHealAttempts = 0
+            audioHealGaveUp = false
+            audioHealNextAt = 0L
+            audioDeadSinceAt = 0L
+            audioHealLastDropSeen = 0
+            CarLifeHijack.resetAudioDeadDrops()
+            return
+        }
+        // 本轮还没建过音频流（没要声音 / 尚未协商出档位）：不折腾
+        if (sender == null) return
+        val client = currentClient
+        if (client == null || client.cancelled || !client.controlSessionAlive) return
+        // 通话中音频由 callWatcher 换档管理，别在这里抢
+        if (audioInCallMode) return
+
+        val now = android.os.SystemClock.uptimeMillis()
+        val drops = CarLifeHijack.audioDeadDrops
+        if (drops == audioHealLastDropSeen) {
+            // 这一拍没有任何新丢弃：引擎停了（用户暂停）或已经不在推 → 连续窗口断开
+            audioDeadSinceAt = 0L
+            return
+        }
+        audioHealLastDropSeen = drops
+        if (audioDeadSinceAt == 0L) audioDeadSinceAt = now
+        if (now - audioDeadSinceAt < AUDIO_HEAL_DEAD_MS) return
+        if (!client.phoneOwnsAudio) return
+        if (now < audioHealNextAt) return
+        if (audioHealAttempts >= AUDIO_HEAL_MAX_ATTEMPTS) {
+            if (!audioHealGaveUp) {
+                audioHealGaveUp = true
+                appendLog(
+                    "AUDIO: 音频自愈已放弃（连续 ${AUDIO_HEAL_MAX_ATTEMPTS} 次重建失败）——" +
+                        "请重启 App 或让车机重连后再试",
+                )
+            }
+            return
+        }
+
+        audioHealAttempts++
+        // 退避：第 1 次立刻试，之后 2/3/4/5 分钟（单位都是分钟）
+        audioHealNextAt = now + audioHealAttempts.coerceAtMost(5) * 60_000L
+        appendLog(
+            "AUDIO: 音频自愈（第 $audioHealAttempts/$AUDIO_HEAL_MAX_ATTEMPTS 次）——" +
+                "引擎仍在推 PCM，但音频流已停，自动重建整条流",
+        )
+        val healed = restartAudioNow("音频自愈（引擎在推 PCM 但音频流已停）", resumePlayback = false)
+        if (healed) {
+            audioDeadSinceAt = 0L
+            audioHealLastDropSeen = 0
+            CarLifeHijack.resetAudioDeadDrops()
+            appendLog("AUDIO: ✓ 音频自愈成功——声音应已恢复")
+        } else {
+            appendLog("AUDIO: 音频自愈本次没成功——${audioHealNextAt - now}ms 后再试")
+        }
     }
 
     /**
@@ -5434,6 +5647,24 @@ object SessionController {
     }
 
     /**
+     * 记住「这一轮真的出过画面」的端点，供车机下次不发 0x4301 时复用（[NetworkMemory]）。
+     *
+     * 只在**首帧到达后**调用：配对成功但没出画面的一轮（SETUP 500、重建协商失败等）
+     * 不应该写进记忆——那种端点多半正是坏的，记下来只会让下次复用照样失败。
+     */
+    private fun rememberNetworkEndpoint() {
+        val ctx = appContext ?: return
+        val endpoint = lastSessionTarget?.endpoint ?: return
+        if (!NetworkMemory.isCacheable(endpoint)) return
+        NetworkMemory.record(ctx, endpoint)
+        appendLog(
+            "NET: 已记住本轮网络信息（SSID=${endpoint.ssid}、" +
+                "${endpoint.ipAddresses.firstOrNull() ?: "(无地址)"}:${endpoint.airPlayPort}）" +
+                "——下次车机不发 0x4301 时可直接复用",
+        )
+    }
+
+    /**
      * 首帧门：SETUP 成功之后等首帧，超时**只报告不拆链**。
      *
      * 等的是「车机真的收到首帧」（`CarLifeHijack.framesDelivered` 相对本次会话起点有增长），
@@ -5453,8 +5684,7 @@ object SessionController {
      * 旧日志在「SETUP 成功」之后就断片了，到底是黑屏、还是 CarLife 没在投，
      * 事后完全无从判断（2026-11-01 日志 090105 就缺这一段）。
      */
-    private fun startFirstFrameGate() {
-        Bg.run("first-frame-gate") {
+    private fun startFirstFrameGate() {        Bg.run("first-frame-gate") {
             videoSessionEnded = false
             // 基准取 attach **之前**的累计送达数（videoSessionFrameBase）：缓存回放成功时
             // framesDelivered 在 attach 里已经涨过，若在这里重新取基准，会把「已经回放了画面」
@@ -5465,6 +5695,7 @@ object SessionController {
             while (android.os.SystemClock.uptimeMillis() < deadline) {
                 if (CarLifeHijack.framesDelivered > base) {
                     connectBudget.markStreaming()
+                    rememberNetworkEndpoint()
                     return@run
                 }
                 // 只在「会话被整体收掉」（retireSession 会把 videoSender 置空）或用户取消时退出；
@@ -5484,6 +5715,7 @@ object SessionController {
             }
             if (CarLifeHijack.framesDelivered > base) {
                 connectBudget.markStreaming()
+                rememberNetworkEndpoint()
                 return@run
             }
             // 超时仍没有任何帧送进车机通道。按「源侧最近是否真出过帧」区分两种失败
@@ -5624,7 +5856,7 @@ object SessionController {
 
     /** BT 会话交接点：拿到 0x5703/0x4301 后两条路径流程一致——绑 WiFi → AirPlay 配对 → SETUP → 推流。 */
     private fun onCarPlayEndpoint(
-        endpoint: Iap2SenderSession.CarPlayEndpoint,
+        endpointIn: Iap2SenderSession.CarPlayEndpoint,
         source: String,
         /**
          * true = 这个端点是「手机已经挂在当前 WiFi 上、我们从这条网络里实际发现的服务」
@@ -5636,6 +5868,7 @@ object SessionController {
          */
         onCurrentWifi: Boolean = false,
     ) {
+        var endpoint = endpointIn
         val context = appContext ?: return
         if (currentClient?.controlSessionAlive == true && resourceStreams?.screenPaused == true) {
             appendLog(">>> [$source] 主屏暂让给车机，控制会话仍活跃——忽略冗余端点")
@@ -5648,6 +5881,29 @@ object SessionController {
         if (videoSender?.isRunning == true) {
             appendLog(">>> [$source] 会话推流中——忽略冗余端点（接收端周期重连的重复 0x4301）")
             return
+        }
+        // 车机没下发 0x4301（空端点）时，先尝试复用「它上次真出过画面时给的网络信息」。
+        //
+        // 依据：同一台车机的热点 SSID/密码/信道/端口是固定的——2026-11-21 别克 BUICK_6369
+        // 四次 0x4301 的无线组参数逐字节相同，而 08:17 那轮整轮零下发，只能干等 90 秒后拆链。
+        // 缺的那一环是持久化：内存快照 [lastGoodEndpoint] 进程一重启就归零，所以落一份盘
+        // （[NetworkMemory]）。只有真正出过首帧的端点才会被记录，见 [startFirstFrameGate]。
+        //
+        // 复用失败（入网失败 / 密码已变）会 [NetworkMemory.forget] 掉该条并回退到原来的
+        // 「等车机下发 0x4301」流程，绝不会反复拿坏凭据撞墙。
+        val originalEndpoint = endpoint
+        var reusedFrom: NetworkMemory.Entry? = null
+        if (endpoint.ssid.isEmpty() && !onCurrentWifi) {
+            val cached = NetworkMemory.pick(context)
+            if (cached != null) {
+                reusedFrom = cached
+                endpoint = cached.endpoint
+                appendLog(
+                    ">>> [$source] 车机未下发 0x4301——复用上次成功建链的网络信息：" +
+                        "SSID=${cached.endpoint.ssid}（${NetworkMemory.describeAge(cached.savedAtMillis)}成功过，" +
+                        "端点 ${cached.endpoint.ipAddresses.firstOrNull() ?: "(无地址)"}:${cached.endpoint.airPlayPort}）",
+                )
+            }
         }
         val attempt =
             synchronized(sessionLifecycleLock) {
@@ -5777,6 +6033,22 @@ object SessionController {
         val continueWithNetwork: (Boolean) -> Unit = proceed@{ bound ->
             if (!ownsAttempt(attempt)) return@proceed
             if (!bound) {
+                // 复用来的凭据入网失败：大概率车机换了热点密码（固件更新 / 恢复出厂）。
+                // 清掉这条记忆并回退到「等车机下发 0x4301」的原流程——不能反复拿坏凭据撞墙。
+                if (reusedFrom != null) {
+                    NetworkMemory.forget(context, reusedFrom.endpoint.ssid)
+                    appendLog(
+                        ">>> [$source] 复用上次网络信息失败（SSID=${reusedFrom.endpoint.ssid}，可能已改密码）" +
+                            "——已清除该条缓存，改为等车机下发 0x4301",
+                    )
+                    phaseHint = "等待车机下发连接信息（0x4301）…"
+                    synchronized(sessionLifecycleLock) {
+                        if (!ownsAttempt(attempt)) return@proceed
+                        releaseAttempt(attempt)
+                    }
+                    watchForPendingStartSession(originalEndpoint, source)
+                    return@proceed
+                }
                 phaseHint = "手机不在车机热点——请到 WLAN 设置加入 ${endpoint.ssid}"
                 appendLog(">>> [$source] 手机当前不在该热点——请到 设置>WLAN 加入 \"${endpoint.ssid}\" 后断开重连")
                 // 这一轮到此为止（没有配对线程会接手），必须自己收尾，否则只有「本轮开始」。
@@ -6500,7 +6772,13 @@ object SessionController {
 
                                         "requestUI" -> {
                                             pendingScreenRequestFromCarUi.set(true)
-                                            appendLog("RESOURCE: 收到车机 requestUI，解除借用限制并申请取回主屏")
+                                            // 完整 params：车机「请把界面交回手机」时带的 url/其它字段
+                                            // 是它唯一一次主动示好的报文，换车排查全靠这行。
+                                            appendLog(
+                                                "RESOURCE: 收到车机 requestUI，解除借用限制并申请取回主屏 · params=" +
+                                                    AirPlayResourceState.paramsText(command["params"]) +
+                                                    " · 当前 ${client.resourceDescription}",
+                                            )
                                             resourceStreams?.requestScreen(fromRequestUi = true)
                                         }
 
@@ -6808,6 +7086,18 @@ object SessionController {
                                         ).also { created = it }
                                     }
                                     val initialSender = screen?.let(makeSender)
+                                    // 会话起步时按落盘设置武装「车机占屏策略」：没有 Activity
+                                    // （开机自启、被冻结后自动恢复）也必须生效，所以读在这里而不是界面里。
+                                    CarPlayResourceStreams.keepScreenStreamOnTake =
+                                        DisplayPrefs.keepScreenStreamOnTake(context)
+                                    appendLog(
+                                        "MODE: 车机占屏策略=" +
+                                            if (CarPlayResourceStreams.keepScreenStreamOnTake) {
+                                                "保留视频流（实验开关开：不 TEARDOWN，归还后补关键帧）"
+                                            } else {
+                                                "常规（TEARDOWN 后重建）"
+                                            },
+                                    )
                                     synchronized(sessionLifecycleLock) {
                                         requireAttempt(attempt)
                                         videoSender = initialSender
@@ -7342,6 +7632,10 @@ object SessionController {
      */
     @Volatile
     private var videoSessionFrameBase = 0L
+
+    /** 本次主屏流重新挂载成功的时刻（`uptimeMillis`；0 = 还没挂过）。只用于日志里的存活时长。 */
+    @Volatile
+    private var screenResumedAtMs = 0L
 
     /** 最近一次向车机推送「没有 CarLife 画面」提示的时刻（`uptimeMillis`；0 = 没推过）。 */
     @Volatile

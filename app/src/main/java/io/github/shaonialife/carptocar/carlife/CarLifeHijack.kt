@@ -3,7 +3,9 @@ package io.github.shaonialife.carptocar.carlife
 import android.content.Context
 import android.os.SystemClock
 import io.github.shaonialife.carptocar.audio.AudioRatePreference
+import io.github.shaonialife.carptocar.input.TouchDomainMapping
 import io.github.shaonialife.carptocar.launcher.settings.AutoLaunchCarWithPrefs
+import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
 import io.github.shaonialife.carptocar.media.MediaSessionsState
 import io.github.shaonialife.carptocar.session.CarNightMode
 import io.github.shaonialife.carptocar.video.FirstFramePolicy
@@ -386,6 +388,29 @@ object CarLifeHijack {
     private var viewH = 0
 
     /**
+     * 「触摸域自适应」开关（设置项，**默认关**；见 `DisplayPrefs.adaptiveTouchDomain`）。
+     *
+     * 开启后，若车机 HID 上报的坐标域明显大于视图域（观测上限超出），
+     * 就按观测上限把上报域线性缩到视图域——专治「点右侧总落到右边缘」的漂移。
+     * 关闭时 `handleTouch` 完全保持原样透传，行为与历史版本一致。
+     */
+    @Volatile
+    var adaptiveTouchDomain: Boolean = false
+
+    /**
+     * 本次手势锁定的映射域（0 = 不映射）。
+     *
+     * 观测上限会随手指移动增长，逐帧重算会让一笔拖拽中途比例跳变、落点抖动，
+     * 所以在 DOWN 时算一次、整笔复用（见 `TouchDomainMapping`）。
+     */
+    private var gestureDomainW = 0
+    private var gestureDomainH = 0
+
+    /** 上一次因「映射域变化」打过日志的域值（-1 = 尚未打过），避免每笔手势刷屏。 */
+    private var loggedDomainW = -1
+    private var loggedDomainH = -1
+
+    /**
      * 当前画布尺寸（触摸报文坐标系）；未接管时为 0。
      *
      * 给需要**合成**触点的路径用（旋钮 → 滑动手势，见
@@ -485,6 +510,33 @@ object CarLifeHijack {
     private var audioDroppedBytes = 0L
     private var lastAudioDropLog = 0L
 
+    /**
+     * 「引擎还在推 PCM，但这条音频通道**已经建成又停了**」的累计次数与最近时刻。
+     *
+     * 与上面 [audioDroppedBytes] 的区别是**成因**：这里是「本来有流、被 stop 掉了」
+     * （发包失败、拆链收尾没建回来），而不是「本次连接没要声音」。前者是可自愈的故障，
+     * 后者是用户的意图——两者混在一起自动重建就变成瞎折腾。
+     *
+     * 2026-11-21 现场：`Message too long` 之后音频流被 stop，此后 10 分钟里引擎每 10 秒
+     * 推一次 PCM、每 10 秒丢一次，日志喊了 60 遍「音频流已停」却没有任何人接手，
+     * 用户只能手动重启。这个计数器就是给 [io.github.shaonialife.carptocar.SessionController]
+     * 的音频自愈看门狗用的信号源。
+     */
+    @Volatile
+    var audioDeadDrops: Int = 0
+        private set
+
+    /** 最近一次「音频流已停但仍收到 PCM」的 uptimeMillis；0 = 从来没有过。 */
+    @Volatile
+    var audioDeadDropAtMillis: Long = 0L
+        private set
+
+    /** 自愈重建成功后清零（否则看门狗会拿着旧计数马上又触发一次）。 */
+    fun resetAudioDeadDrops() {
+        audioDeadDrops = 0
+        audioDeadDropAtMillis = 0L
+    }
+
     /** 最近一个 GOP 缓存（从关键帧起），供会话建立瞬间「补历史帧」。 */
     private val gop = ArrayDeque<Pair<ByteArray, Boolean>>()
     private var gopBytes = 0
@@ -578,15 +630,23 @@ object CarLifeHijack {
     fun sendThemeChange(night: Boolean): Boolean = client?.sendThemeChange(night) ?: false
 
     /**
-     * 车机语音键 → CarLife 硬键（0x68008）。
+     * 车机语音键 → CarLife 语音（1.2.78 起走 `0x10066`，不再走 `0x68008`）。
      *
-     * [keycode] 取 [CarLifeProtocol.HardKey.VR_START]（起识别）或
-     * [CarLifeProtocol.HardKey.VR_STOP]（长按松手时收尾）。CarLife+ 收到后用它
-     * **自己的麦克风**起语音识别，不需要我们回传车机麦克风，所以这里只是一条控制命令，
-     * 不牵扯音频通道。
+     * 起识别：[CarLifeProtocol.HU_VOICE_CONTROL]（`command=1 opt=2`）。
+     * 收尾（PTT 松手）：仍发 `0x68008 keycode=0x22 VR_STOP`——`0x10066` 的「停」语义
+     * 没有实证，而 `VR_STOP` 在引擎没起识别时是无害的空操作，宁可少猜一条。
+     *
+     * 两条都只写控制通道：CarLife+ 用**手机自己的麦克风**识别，不牵扯音频通道。
      */
     fun sendVoiceKey(keycode: Int = CarLifeProtocol.HardKey.VR_START): Boolean =
-        client?.sendHardKeyCode(keycode) ?: false
+        if (keycode == CarLifeProtocol.HardKey.VR_STOP) {
+            client?.sendHardKeyCode(CarLifeProtocol.HardKey.VR_STOP) ?: false
+        } else {
+            client?.sendVoiceControl(
+                CarLifeProtocol.VoiceControl.START_COMMAND,
+                CarLifeProtocol.VoiceControl.START_OPT,
+            ) ?: false
+        }
 
     /**
      * 车机媒体键 → CarLife 硬键（0x68008），供无通知监听授权或第三方播放器场景兜底。
@@ -789,6 +849,20 @@ object CarLifeHijack {
         multiMoves = 0
         observedMaxX = 0
         observedMaxY = 0
+        gestureDomainW = 0
+        gestureDomainH = 0
+        loggedDomainW = -1
+        loggedDomainH = -1
+        // 设置项每次接管时重读：开关可能在 App 未重启的情况下被改过
+        adaptiveTouchDomain = DisplayPrefs.adaptiveTouchDomain(context)
+        log(
+            if (adaptiveTouchDomain) {
+                "CARLIFE: 触摸域自适应已开启——触摸超出画面时按实测上报域映射" +
+                    "（判定行：「触摸域自适应——上报域 … → 视图 …」）"
+            } else {
+                "CARLIFE: 触摸域自适应关闭——触摸坐标原样透传（与历史版本一致）"
+            },
+        )
         hasVideo = false
         lastSourceFrameAt = 0L
         stallSince = 0L
@@ -1496,6 +1570,16 @@ object CarLifeHijack {
         width: Int,
         height: Int,
     ) {
+        // 视图域变了（换车机/换分辨率），观测上限与已锁定的映射域全部作废：
+        // 拿旧域的观测值去缩新画面只会制造新的偏移。
+        if (width != viewW || height != viewH) {
+            observedMaxX = 0
+            observedMaxY = 0
+            gestureDomainW = 0
+            gestureDomainH = 0
+            loggedDomainW = -1
+            loggedDomainH = -1
+        }
         viewW = width
         viewH = height
     }
@@ -1574,8 +1658,15 @@ object CarLifeHijack {
                     io.github.shaonialife.carptocar.SessionController.audioSender
                 }
             if (sender?.isRunning == true) return
-            audioDroppedBytes += size
             val now = android.os.SystemClock.uptimeMillis()
+            // 「流建成过、现在停了」（发包失败被 stop / 收尾没建回来）——这才是可自愈的故障，
+            // 计数交给 SessionController 的音频自愈看门狗。sender == null 是「本轮没要声音」，
+            // 属于用户意图，不计数。
+            if (sender != null) {
+                audioDeadDrops++
+                audioDeadDropAtMillis = now
+            }
+            audioDroppedBytes += size
             if (now - lastAudioDropLog >= AUDIO_DROP_LOG_MS) {
                 lastAudioDropLog = now
                 // 文案要点：这里只说明「没有可用的 AirPlay 音频流」，**不是**「用户没勾声音」。
@@ -1643,10 +1734,16 @@ object CarLifeHijack {
         if (viewW <= 0 || viewH <= 0) return true
 
         val now = android.os.SystemClock.uptimeMillis()
-        val tx = x.coerceIn(0, viewW - 1)
-        val ty = y.coerceIn(0, viewH - 1)
+        // 顺序不能变：先记**原始**观测值（钳制前，才能发现「上报域 > 视图域」），
+        // 再按它锁本次手势的映射域，最后才换算——DOWN 那一笔自己也要用刚观测到的域，
+        // 否则第一下「点右边缘」还是会被钳到最右缘，用户得点第二次才准。
         if (x > observedMaxX) observedMaxX = x
         if (y > observedMaxY) observedMaxY = y
+        // 新手势的两种情形都要重锁：①本来就没按住；②上一笔漏了 UP 且超时（下方补 UP 后
+        // 仍然算新的一笔）——用与下面完全相同的判定，避免域停留在上一笔。
+        if (down && (!touchPressed || now - lastTouchAt > NEW_GESTURE_GAP_MS)) lockGestureDomain()
+        val tx = TouchDomainMapping.map(x, viewW, gestureDomainW).coerceIn(0, viewW - 1)
+        val ty = TouchDomainMapping.map(y, viewH, gestureDomainH).coerceIn(0, viewH - 1)
 
         // 槽 1 单独处理：它只会让整笔手势切换到复合动作通道，不参与单点状态机。
         if (slot == 1) {
@@ -1687,7 +1784,7 @@ object CarLifeHijack {
                 lastMoveY = ty
                 hu.touchDown(tx, ty)
                 logSink?.invoke(
-                    "CARLIFE: 触控 ↓ ($x,$y)→($tx,$ty)（视图 ${viewW}x$viewH）",
+                    "CARLIFE: 触控 ↓ ($x,$y)→($tx,$ty)（视图 ${viewW}x$viewH${touchDomainNote()}）",
                 )
             }
 
@@ -1732,10 +1829,54 @@ object CarLifeHijack {
         if (touchCount % 200 == 0) {
             logSink?.invoke(
                 "CARLIFE: 触控累计 $touchCount 条（已写入通道 ${hu.sentTouchCount} 条，" +
-                    "坐标观测上限 ${observedMaxX}x${observedMaxY}，视图 ${viewW}x$viewH）",
+                    "坐标观测上限 ${observedMaxX}x${observedMaxY}，视图 ${viewW}x$viewH${touchDomainNote()}）",
             )
         }
         return true
+    }
+
+    /**
+     * 按当前观测上限锁定本次手势的映射域（0 = 不映射，原样透传）。
+     *
+     * 只在「触摸域自适应」开关打开、且上报域确实大于视图域时才启用；
+     * 域发生变化打一行日志（每笔手势都打会刷屏，只在变化时打），上车验证看这行。
+     */
+    private fun lockGestureDomain() {
+        if (!adaptiveTouchDomain) {
+            gestureDomainW = 0
+            gestureDomainH = 0
+            // 开关关掉后重新打开要能重新打日志：复位成「未打过」
+            loggedDomainW = -1
+            loggedDomainH = -1
+            return
+        }
+        val dw = TouchDomainMapping.domainFor(viewW, observedMaxX, enabled = true)
+        val dh = TouchDomainMapping.domainFor(viewH, observedMaxY, enabled = true)
+        gestureDomainW = if (dw == viewW) 0 else dw
+        gestureDomainH = if (dh == viewH) 0 else dh
+        if (gestureDomainW == loggedDomainW && gestureDomainH == loggedDomainH) return
+        loggedDomainW = gestureDomainW
+        loggedDomainH = gestureDomainH
+        if (gestureDomainW == 0 && gestureDomainH == 0) {
+            logSink?.invoke(
+                "CARLIFE: 触摸域自适应已开——上报域未超出视图 ${viewW}x$viewH" +
+                    "（观测上限 ${observedMaxX}x${observedMaxY}），仍原样透传",
+            )
+            return
+        }
+        logSink?.invoke(
+            "CARLIFE: 触摸域自适应——上报域 " +
+                "${if (gestureDomainW > 0) gestureDomainW else viewW}x" +
+                "${if (gestureDomainH > 0) gestureDomainH else viewH}" +
+                " → 视图 ${viewW}x$viewH（观测上限 ${observedMaxX}x${observedMaxY}）",
+        )
+    }
+
+    /** 触摸日志里附带当前映射状态（未映射时返回空串，保持旧日志格式）。 */
+    private fun touchDomainNote(): String {
+        if (gestureDomainW == 0 && gestureDomainH == 0) return ""
+        return "，上报域 ${if (gestureDomainW > 0) gestureDomainW else viewW}" +
+            "x${if (gestureDomainH > 0) gestureDomainH else viewH}"
     }
 
     /**
