@@ -1294,6 +1294,28 @@ class AirPlayClient(
         return allAccepted
     }
 
+    /**
+     * 按 connectionId 拆**单条**流（音频重建专用）。
+     *
+     * [teardownStream] 是按 type 拆的——同一 type 上可能同时挂着媒体与通话两条流
+     * （`audioType` 不同、`streamType` 相同），重建媒体流时不能把通话流一起拆掉。
+     * 这里精确到 connId；`connectionId <= 0` 时退回按 type 拆（旧流没有登记 connId 的
+     * 情况，例如上一版建的流）。
+     *
+     * @return 车机是否接受了 TEARDOWN。失败也继续 SETUP：部分固件对单流 TEARDOWN
+     *   只回 ACK 或直接忽略，真正的判据是随后那条 SETUP 能不能过。
+     */
+    fun teardownStreamById(
+        type: Long,
+        connectionId: Long,
+        displayUuid: String? = null,
+    ): Boolean {
+        if (connectionId <= 0L) return teardownStream(type, displayUuid)
+        val accepted = teardownStreamDescriptor(type, connectionId, displayUuid)
+        if (accepted) activeStreams.remove(connectionId, type)
+        return accepted
+    }
+
     fun assertModes(): Boolean =
         synchronized(modesPublicationLock) {
             // 主屏/主音频改为按需申请（acquireScreenResource / acquireAudioResource），这里只复述当前归属
@@ -2219,6 +2241,7 @@ class AirPlayClient(
      * 内置播放器经 0x10035 推来的歌名）。null = 始终发空态。
      */
     var nowPlayingSource: (() -> CarPlayNowPlaying?)? = null
+    internal var nowPlayingOverride: (() -> CarPlayNowPlaying?)? = null
 
     /**
      * 封面字节提供者：入参是 `0x5001` 里声明的 `artworkId`，返回 JPEG 原始字节。
@@ -2251,6 +2274,7 @@ class AirPlayClient(
                     alive = { socket?.isClosed == false },
                     mfiContext = context,
                     nowPlayingProvider = { nowPlayingSource?.invoke() },
+                    nowPlayingOverride = { nowPlayingOverride?.invoke() },
                     callStateProvider = { callStateSource?.invoke() ?: 0 },
                     artworkProvider = { id -> artworkSource?.invoke(id) },
                 ).also {

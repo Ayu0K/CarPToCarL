@@ -61,6 +61,7 @@ import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
 import io.github.shaonialife.carptocar.launcher.settings.NowPlayingTextSourcePrefs
 import io.github.shaonialife.carptocar.media.MediaSessionFallback
 import io.github.shaonialife.carptocar.media.MediaSessionsState
+import io.github.shaonialife.carptocar.media.NavigationNowPlaying
 import io.github.shaonialife.carptocar.media.NotificationAccess
 import io.github.shaonialife.carptocar.net.AirPlayFeatures
 import io.github.shaonialife.carptocar.net.CarNetworkReadiness
@@ -496,6 +497,7 @@ object SessionController {
     fun ensure(context: Context) {
         appContext = context.applicationContext
         ensureSessionObjects(context.applicationContext)
+        CarLifeHijack.navigationNowPlayingEnabled = DisplayPrefs.navigationNowPlaying(context)
         // 横屏兼容写入失败的原因（user build 限制 / shell 无权限）只有这里能落盘：
         // 车机侧设置面板的 toast 只给用户看，排查需要日志。
         AppOrientationCompat.diagSink = ::appendLog
@@ -886,6 +888,7 @@ object SessionController {
      * 「真爱假说」后，18:35 重连的整轮会话即使媒体事件触发也会被这行去重静默吞掉
      * ——车机端持续空白，日志里连一行「补推」都没有（2026-10-25 实测）。
      */
+    @Synchronized
     fun resetNowPlayingDedupe() {
         lastPushedNowPlayingKey = null
         lastPushedArtworkKey = null
@@ -894,6 +897,7 @@ object SessionController {
         artworkKey = null
         artworkBytes = null
         artworkId = 0
+        navigationArtwork = null
         artworkSeq = 0
         lastEncodedSource = null
         lastEncodedBytes = null
@@ -921,6 +925,28 @@ object SessionController {
 
     /** 标识符分配序号，1..255 循环 —— **换了 id 车机才会重新要图**（同 id 走它的缓存）。 */
     private var artworkSeq: Int = 0
+
+    private data class NavigationArtwork(val id: Int, val bytes: ByteArray)
+
+    @Volatile
+    private var navigationArtwork: NavigationArtwork? = null
+
+    @Synchronized
+    private fun ensureNavigationArtwork(bytes: ByteArray): Int {
+        val previous = navigationArtwork
+        if (previous != null && previous.bytes.contentEquals(bytes)) return previous.id
+        val id = allocateArtworkId(exclude = artworkId)
+        navigationArtwork = NavigationArtwork(id, bytes)
+        return id
+    }
+
+    // 音乐封面与箭头共享同一个车机编号空间，环回时避开另一张仍保留的图片。
+    private fun allocateArtworkId(exclude: Int): Int {
+        do {
+            artworkSeq = artworkSeq % 254 + 1
+        } while (artworkSeq == exclude)
+        return artworkSeq
+    }
 
     /**
      * 上次编码用的**源图对象**与它的编码结果。
@@ -965,8 +991,7 @@ object SessionController {
             appendLog("ART: 封面与上一张相同 ${bytes.size}B —— 沿用 id=$artworkId（不重传）")
             return artworkId
         }
-        artworkSeq = artworkSeq % 254 + 1
-        artworkId = artworkSeq
+        artworkId = allocateArtworkId(exclude = navigationArtwork?.id ?: 0)
         artworkBytes = bytes
         appendLog("ART: 封面就绪 id=$artworkId ${bytes.size}B（$key）")
         return artworkId
@@ -1562,6 +1587,16 @@ object SessionController {
     /** 本轮真正用上的音频档位（拆链归因与记忆回写用；null = 本次没有音频）。 */
     @Volatile
     private var activeAudioProfile: AudioProfile? = null
+
+    /**
+     * 当前媒体音频流的 `streamConnectionID`（0 = 没有/已拆）。
+     *
+     * 重建音频流时必须**先按这个 id TEARDOWN 旧流**：宝马车机对同一
+     * `(type, audioType)` 上的第二条流一律 `400 Bad Request`（1.2.81 现场连按 4 次
+     * 「立即重启一次」全是 400），旧流不拆就永远建不起来。
+     */
+    @Volatile
+    private var activeAudioConnectionId: Long = 0L
 
     /**
      * 当前发给车机的音频档采样率（Hz）；0 = 本次没有音频流。
@@ -4610,6 +4645,7 @@ object SessionController {
                 micUplink = uplink
             }
             activeAudioProfile = profile
+            activeAudioConnectionId = audio.streamConnectionId
             activeAudioReceiverKey = identity
             activeAudioStartedAt = android.os.SystemClock.uptimeMillis()
             val sender =
@@ -4632,6 +4668,7 @@ object SessionController {
             if (!sender.startPassthrough()) {
                 audioSender = null
                 activeAudioProfile = null
+                activeAudioConnectionId = 0L
                 activeAudioStartedAt = 0L
                 false
             } else {
@@ -4646,6 +4683,7 @@ object SessionController {
             appendLog("AUDIO: 通道启动异常 - ${error.message}")
             audioSender = null
             activeAudioProfile = null
+            activeAudioConnectionId = 0L
             activeAudioStartedAt = 0L
             false
         }
@@ -5052,7 +5090,28 @@ object SessionController {
         val context = appContext?.applicationContext ?: return false
         val old = audioSender ?: return false
         if (!old.isRunning) return false
-        appendLog("AUDIO: $reason → 重建音频流（接收端音频输出在通话期间被释放，需新建流才会重开）")
+        // 通话中在线的是通话档（activeCallProfile），这里按 activeAudioProfile 重建
+        // 会把通话流拆掉换成媒体流——声音直接串台。挂断后的切回由 switchAudioScene 负责。
+        if (audioInCallMode) {
+            appendLog("AUDIO: $reason → 当前在通话档上，不重建媒体流（挂断后会自动切回）")
+            return false
+        }
+        val oldConnId = activeAudioConnectionId
+        appendLog(
+            "AUDIO: $reason → 重建音频流（先 TEARDOWN 旧流 connId=$oldConnId、再 SETUP 新流：" +
+                "同一 (type,audioType) 上不允许两条并存）",
+        )
+        // 1) 先停发包：TEARDOWN 之后旧流不该再有包打到已释放的端口
+        old.stop()
+        audioSender = null
+        activeAudioStartedAt = 0L
+        // 2) 拆旧流。宝马车机对同一 (type,audioType) 的第二条流一律 400，
+        //    不拆就永远建不起来（1.2.81 现场连按 4 次「立即重启一次」全是 400）。
+        if (!client.teardownStreamById(profile.streamType, oldConnId)) {
+            appendLog("AUDIO: 旧流 TEARDOWN 未被接受（connId=$oldConnId）——仍尝试 SETUP：部分固件只回 ACK")
+        }
+        activeAudioConnectionId = 0L
+        // 3) 再建新流
         val info =
             try {
                 // 重建时把上行端口继续声明进去：不然车机以为手机不要麦了，通话里反而没上行
@@ -5062,14 +5121,12 @@ object SessionController {
                 null
             }
         if (info == null) {
-            appendLog("AUDIO: 重建协商失败——保持原音频流继续推（不降级成无声）")
+            appendLog("AUDIO: 重建 SETUP 失败——旧流已拆，本条音频无法恢复（重连会话可恢复）")
             return false
         }
+        activeAudioConnectionId = info.streamConnectionId
         // 新流的密钥盐变了，上行监听跟换
         micUplink?.updateKey(secret, info.streamConnectionId)
-        // 新流已就绪：停旧发送端。旧流不再有包，接收端会在超时后自行回收。
-        old.stop()
-        audioSender = null
         // 看门狗线程跟随 audioSender 字段：换流后自动续上，所以这里**不该**置
         // callWatcher = null —— 那只丢引用、旧线程仍在跑，紧接着 startCallWatcher()
         // 再起一个就成双线程（两边同时切音频流）。startCallWatcher 自己有 isAlive 检查。
@@ -5091,6 +5148,7 @@ object SessionController {
         if (!sender.startPassthrough()) {
             audioSender = null
             activeAudioStartedAt = 0L
+            activeAudioConnectionId = 0L
             appendLog("AUDIO: 音频流重建后启动失败——本次仅推视频（重连可恢复）")
             return false
         }
@@ -5181,6 +5239,8 @@ object SessionController {
             return false
         }
         micUplink?.updateKey(secret, info.streamConnectionId)
+        // 跟随当前在线的那条流：切回媒体档后，「立即重启一次」要拆的就是它
+        activeAudioConnectionId = info.streamConnectionId
         // 新流已就绪：停旧流。旧流不再有包，接收端会在超时后自行回收。
         old.stop()
         audioSender = null
@@ -5414,6 +5474,7 @@ object SessionController {
             )
             uiHintSink?.invoke("车机在补发 RECORD 后断开——下次连接改为只发一次 RECORD")
             activeAudioProfile = null
+            activeAudioConnectionId = 0L
             activeAudioStartedAt = 0L
             return
         }
@@ -5428,6 +5489,7 @@ object SessionController {
                     (activeCallProfile?.let { "（通话档 ${it.label}）" } ?: ""),
             )
             activeAudioProfile = null
+            activeAudioConnectionId = 0L
             activeAudioStartedAt = 0L
             return
         }
@@ -5442,12 +5504,14 @@ object SessionController {
                     "档位记忆保持不变）",
             )
             activeAudioProfile = null
+            activeAudioConnectionId = 0L
             activeAudioStartedAt = 0L
             return
         }
         val lived = if (startedAt > 0) android.os.SystemClock.uptimeMillis() - startedAt else -1L
         // 本轮记忆很快失效：下次连接重新按最新记忆选档
         activeAudioProfile = null
+        activeAudioConnectionId = 0L
         activeAudioStartedAt = 0L
         if (startedAt == 0L || identity.isBlank()) return
         val ctx = appContext?.applicationContext
@@ -6405,9 +6469,14 @@ object SessionController {
                             // 0x5001 NowPlayingUpdate 的数据源：优先系统媒体会话，兜底 CarLife
                             // 0x10035。读不到（null）时虚拟链路自动退化为空态。
                             created.nowPlayingSource = { buildNowPlaying() }
+                            val navigation = NavigationNowPlaying(::buildNowPlaying, ::ensureNavigationArtwork)
+                            created.nowPlayingOverride = { navigation.displayOverride(CarLifeHijack.navigationDisplay()) }
                             // 封面字节：iAP2 文件传输（session 12）按 0x5001 里声明的 id 来取图。
-                            // 只认当前这一张 —— 旧 id 的迟到请求直接给 null，避免传错图。
-                            created.artworkSource = { id -> artworkBytes?.takeIf { id == artworkId } }
+                            // 分别按编号查当前箭头和音乐封面，拿不到的旧编号直接丢弃。
+                            created.artworkSource = { id ->
+                                navigationArtwork?.takeIf { it.id == id }?.bytes
+                                    ?: artworkBytes?.takeIf { id == artworkId }
+                            }
                             // 0x4155 CallStateUpdate 的数据源：车机订阅通话状态时按真实值应答，
                             // 否则它认定这台手机永远不打电话，通话时不切音频通路。
                             created.callStateSource = { callStateOf() }
