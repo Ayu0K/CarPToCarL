@@ -3,11 +3,11 @@ package io.github.shaonialife.carptocar.launcher.settings
 import android.content.Context
 
 /**
- * 「显示」面板偏好：视频流/虚拟屏的分辨率缩放与目标帧率。
+ * 「显示」面板偏好：视频流的分辨率缩放与目标帧率。
  *
- * - 分辨率缩放（30%–160%）：按车机通告分辨率的百分比生成流画布与虚拟屏，
+ * - 分辨率缩放（30%–160%）：按车机通告分辨率的百分比生成流画布，
  *   密度同步缩放（逻辑布局不变，只改像素量）。**仅下次连接生效**——
- *   编码器与全部虚拟屏按会话建立时的尺寸创建，运行中改无意义。
+ *   编码器按会话建立时的尺寸创建，运行中改无意义。
  * - 帧率：**没有设置项**。车机 `/info displays[0].maxFPS` 报了就跟随，没报按 [FPS]（60）
  *   ——判定在 `video/StreamFps.kt`，本文件只提供默认值。
  *
@@ -22,10 +22,6 @@ object DisplayPrefs {
 
     /** 车机没声明 maxFPS 时的目标帧率（无设置项，判定见 `video/StreamFps.kt`）。 */
     const val FPS = 60
-
-    /** 触摸 move 注入节流默认值（ms）：0=默认关闭，交互滞后时在「显示」面板调高试验。 */
-    const val MOVE_THROTTLE_DEFAULT = 0
-    const val MOVE_THROTTLE_MAX = 48
 
     /**
      * 触摸域自适应的默认值：**关**。
@@ -53,7 +49,6 @@ object DisplayPrefs {
 
     private const val PREFS_NAME = "settings"
     private const val KEY_SCALE = "display_scale_percent"
-    private const val KEY_MOVE_THROTTLE = "move_throttle_ms"
     private const val KEY_ADAPTIVE_TOUCH = "adaptive_touch_domain"
     private const val KEY_KEEP_SCREEN_STREAM = "keep_screen_stream_on_take"
     private const val KEY_PROACTIVE_AUDIO = "proactive_audio_on_link"
@@ -156,24 +151,6 @@ object DisplayPrefs {
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putInt(KEY_SCALE, percent.coerceIn(SCALE_MIN, SCALE_MAX))
-            .apply()
-    }
-
-    /** 触摸 move 注入节流（ms；0=关闭）。 */
-    fun moveThrottleMs(context: Context): Int =
-        context
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getInt(KEY_MOVE_THROTTLE, MOVE_THROTTLE_DEFAULT)
-            .coerceIn(0, MOVE_THROTTLE_MAX)
-
-    fun setMoveThrottleMs(
-        context: Context,
-        ms: Int,
-    ) {
-        context
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putInt(KEY_MOVE_THROTTLE, ms.coerceIn(0, MOVE_THROTTLE_MAX))
             .apply()
     }
 

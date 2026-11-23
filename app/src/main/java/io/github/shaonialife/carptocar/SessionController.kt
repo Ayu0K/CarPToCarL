@@ -27,7 +27,6 @@ import io.github.shaonialife.carptocar.bt.BtSessionGate
 import io.github.shaonialife.carptocar.bt.Iap2BluetoothClient
 import io.github.shaonialife.carptocar.bt.Iap2BluetoothServer
 import io.github.shaonialife.carptocar.bt.TargetDevicePrefs
-import io.github.shaonialife.carptocar.capture.HiddenDisplaySource
 import io.github.shaonialife.carptocar.carlife.CarGpsFix
 import io.github.shaonialife.carptocar.carlife.CarLifeHijack
 import io.github.shaonialife.carptocar.carlife.CarLifeMediaInfo
@@ -56,8 +55,6 @@ import io.github.shaonialife.carptocar.input.KnobRouter
 import io.github.shaonialife.carptocar.input.MediaKeyRoute
 import io.github.shaonialife.carptocar.input.TouchReports
 import io.github.shaonialife.carptocar.input.TouchRouter
-import io.github.shaonialife.carptocar.launcher.VirtualLauncher
-import io.github.shaonialife.carptocar.launcher.settings.AppOrientationCompat
 import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
 import io.github.shaonialife.carptocar.launcher.settings.NowPlayingTextSourcePrefs
 import io.github.shaonialife.carptocar.media.MediaSessionFallback
@@ -91,8 +88,8 @@ import io.github.shaonialife.carptocar.session.AppStateReporter
 import io.github.shaonialife.carptocar.session.AsyncSessionStop
 import io.github.shaonialife.carptocar.session.CarNightMode
 import io.github.shaonialife.carptocar.session.ConnectionPreflight
+import io.github.shaonialife.carptocar.session.ReconnectGate
 import io.github.shaonialife.carptocar.session.SessionAttemptGate
-import io.github.shaonialife.carptocar.ui.ScreenDimmer
 import io.github.shaonialife.carptocar.util.Bg
 import io.github.shaonialife.carptocar.util.ConnectBudget
 import io.github.shaonialife.carptocar.util.ConnectStage
@@ -437,26 +434,16 @@ object SessionController {
     private const val WIFI_JOIN_DEDUPE_MS = 5_000L
 
     /**
-     * 建链失败后的自动重试退避（毫秒）。
+     * 自动重连的唯一预算与互斥（建链失败 / 解冻恢复共用）。
      *
-     * 车机侧会话残留时立刻重连必然失败（对方还没清干净旧会话），等它一拍才有机会：
      * 3s 覆盖「刚被拆、马上能重进」，10s 覆盖「车机重启 AirPlay 服务」，30s 覆盖
-     * 「上一轮被硬断后 TCP 端口彻底关掉再开」。三次用完还在失败就是车机侧真坏了
-     * （2026-11-02 MBUX：SETUP 回 200 却 7ms 后 FIN），继续怼只会刷屏。
-     */
-    private val CONNECT_RETRY_BACKOFF_MS = longArrayOf(3_000L, 10_000L, 30_000L)
-
-    /**
-     * 建链失败自动重试的互斥 + 序号。
+     * 「端口彻底关掉再开」；三次用完还在失败就是车机侧真坏了（2026-11-02 MBUX：
+     * SETUP 回 200 却 7ms 后 FIN），继续怼只会刷屏并把 CarLife 引擎反复踢下线。
      *
-     * [retryGeneration] 是「这一轮重试还算不算数」的令牌：车机 ctrl 邀请到达时
-     * 会把它 +1 并立刻另起一轮，挂在退避睡眠里的旧线程醒来后发现令牌变了就安静退出，
-     * 不会叠出两轮并行交接（两轮同时配对必然互相 retireSession）。
+     * 以前解冻恢复另有一套 3/6/12/24 秒循环，与本预算叠加成每 10~20 秒一轮的
+     * 重连风暴（MGU-81 日志 17:43~17:47）；现在两个触发源都走 [ReconnectGate]。
      */
-    private val connectRetryLock = Any()
-    private var connectRetryScheduled = false
-    private var connectRetryAttempt = 0
-    private var connectRetryGeneration = 0
+    private val reconnectGate = ReconnectGate(log = { line -> appendLog(line) })
 
     /**
      * 「复用网络 ≠ 复用认证」：同一接收端连续两轮没建立起会话，下一轮强制重做认证。
@@ -497,9 +484,6 @@ object SessionController {
     fun ensure(context: Context) {
         appContext = context.applicationContext
         ensureSessionObjects(context.applicationContext)
-        // 横屏兼容写入失败的原因（user build 限制 / shell 无权限）只有这里能落盘：
-        // 车机侧设置面板的 toast 只给用户看，排查需要日志。
-        AppOrientationCompat.diagSink = ::appendLog
         // 主线程调用 shell 的告警（历史上两次真机 ANR 都源于此；HKS 下 logcat 不可读）
         SysShell.violationSink = ::appendLog
         installNowPlayingBridge()
@@ -1569,9 +1553,6 @@ object SessionController {
     /** 通话状态看门狗线程（音频会话期间每秒看一次 AudioManager.mode）。 */
     private var callWatcher: Thread? = null
 
-    @Volatile
-    var currentHiddenSource: HiddenDisplaySource? = null
-
     /** 当前会话的共享密钥与接收端地址：投影授权晚于连接时，动态补启音频用。 */
     @Volatile
     var currentSharedSecret: ByteArray? = null
@@ -1787,17 +1768,6 @@ object SessionController {
      */
     private const val AUDIO_REBUILD_DELAY_MS = 2_500L
 
-    /**
-     * 解冻后重建会话的退避序列（ms）。
-     *
-     * 车机撤会话到重新开放 AirPlay 端口之间有一段空窗，紧贴着重连只会被
-     * Connection refused 打回；3/6/12/24 秒四轮覆盖 45 秒，足够它把旧会话收干净。
-     */
-    private val recoveryBackoffMillis = longArrayOf(3_000L, 6_000L, 12_000L, 24_000L)
-
-    /** 每次重建后给交接流程的观察窗：配对 + SETUP + RECORD 正常 3~6 秒出首帧。 */
-    private const val RECOVERY_SETTLE_MILLIS = 8_000L
-
     /** 兼容模式常开监听的复检间隔：监听/占位记录掉了多久之内必须被发现。 */
     private const val BT_COMPAT_REVIVE_MILLIS = 30_000L
 
@@ -1880,11 +1850,7 @@ object SessionController {
                 // 同时记录对端断链避让窗口，交由车机主动回连或下发新的连接邀请。
                 BtSessionGate.noteRemoteSessionEnded()
                 pendingInviteAtMs = 0L
-                synchronized(connectRetryLock) {
-                    connectRetryGeneration++
-                    connectRetryScheduled = false
-                    connectRetryAttempt = 0
-                }
+                reconnectGate.reset("已建立会话由对端结束")
                 phaseHint = "车机已断开本次会话，等待车机重连邀请…"
                 appendLog("SESSION: 已建立会话由对端结束（$reason）——转入被动等待车机邀请或蓝牙回连")
             } else {
@@ -1982,9 +1948,6 @@ object SessionController {
      */
     @Volatile
     private var pendingInviteAtMs: Long = 0L
-
-    /** 解冻恢复的互斥：一次只允许一条恢复线程，避免冻结抖动叠出好几轮并行重建。 */
-    private val freezeRecovery = AtomicBoolean(false)
 
     /** 用户当前是否希望保持连接（「启动连接」置 true、「断开」置 false）——解冻恢复的前置条件。 */
     @Volatile
@@ -2086,26 +2049,21 @@ object SessionController {
             appendLog("PROC: 解冻后用户已断开——不自动恢复")
             return
         }
-        if (!freezeRecovery.compareAndSet(false, true)) {
-            appendLog("PROC: 上一次解冻恢复还在进行——本次跳过")
-            return
-        }
         Bg.run("freeze-recovery") {
             try {
                 recoverAfterFreeze(frozenMillis)
             } catch (error: Exception) {
                 appendLog("PROC: 解冻恢复异常 - ${error.message ?: error.javaClass.simpleName}")
-            } finally {
-                freezeRecovery.set(false)
             }
         }
     }
 
     /**
-     * 解冻后的恢复流程：先给积压的帧一点时间自己缓过来，仍无画面才按退避重建。
+     * 解冻后的恢复流程：先给积压的帧一点时间自己缓过来，仍无画面才交给 [reconnectGate]。
      *
-     * 退避间隔逐轮翻倍（3/6/12/24 秒）：车机撤会话后要先关旧会话、再重新开放 AirPlay
-     * 端口，这段时间里猛怼只会被 Connection refused 打回来，还多刷一堆失败日志。
+     * 车机撤会话后要先关旧会话、再重新开放 AirPlay 端口，紧贴着重连只会被
+     * Connection refused 打回来。退避与互斥统一由 [ReconnectGate] 负责，与建链失败
+     * 重试共用同一份预算——两套并行会让 MGU-81 每 10~20 秒重连一次。
      */
     private fun recoverAfterFreeze(frozenMillis: Long) {
         val seconds = frozenMillis / 1_000
@@ -2129,46 +2087,24 @@ object SessionController {
                 } +
                 "，推流=" + (if (isStreaming()) "在" else "已断"),
         )
-        if (endpoint == null) {
+        if (endpoint == null || lastSessionTarget == null) {
             // 还没有热点凭据：重连只能靠车机重新下发 0x4301，先把蓝牙监听拉起来等
             appendLog("PROC: 无端点可重走——重新拉起蓝牙链路，等车机回连")
             restartBluetoothForRecovery()
             return
         }
-        recoveryBackoffMillis.forEachIndexed { index, delay ->
-            if (connectCancelled || isStreaming()) return
-            sleepQuietly(delay)
-            if (connectCancelled || isStreaming()) return
-            appendLog(
-                "PROC: 重建会话 第 ${index + 1}/${recoveryBackoffMillis.size} 次" +
-                    "（退避 ${delay}ms · 端点 ${endpoint.ssid}）",
-            )
-            // 上一轮可能卡在「会话处理中」：冻结后它已不可能再推进，强释放让本轮进场。
-            // 不清的话 onCarPlayEndpoint 会直接以「已有会话在处理中」把恢复请求丢掉。
-            if (attemptGate.isActive) {
-                appendLog("PROC: 上一轮仍占着闸门——" + attemptGate.describe())
-                attemptGate.end("解冻后自动恢复——强制释放上一轮")
-            }
-            restartBluetoothForRecovery()
-            onCarPlayEndpoint(endpoint, "解冻后自动恢复 #${index + 1}")
-            // 给这一轮交接起步的时间：配对 + SETUP + RECORD 正常在 3~6 秒内出首帧
-            var waited = 0L
-            while (waited < RECOVERY_SETTLE_MILLIS) {
-                sleepQuietly(500)
-                waited += 500
-                if (connectCancelled || isStreaming()) break
-            }
-            if (isStreaming()) {
-                appendLog("PROC: ✓ 会话已自动恢复（第 ${index + 1} 次尝试）")
-                return
-            }
+        // 冻结期间 onSenderLinkClosed 会把取消标志置真；判据是用户意图（sessionWanted），
+        // 用户没断开就把它清掉，否则统一的重试入口会把自己拦下来。
+        connectCancelled = false
+        // 上一轮可能卡在「会话处理中」：冻结后它已不可能再推进，强释放让恢复进场。
+        if (attemptGate.isActive) {
+            appendLog("PROC: 上一轮仍占着闸门——" + attemptGate.describe())
+            attemptGate.end("解冻后自动恢复——强制释放上一轮")
         }
-        if (!connectCancelled && !isStreaming()) {
-            appendLog(
-                "PROC: 自动恢复未成功（${recoveryBackoffMillis.size} 次退避都没起来）——" +
-                    "请手动点「启动连接」；若反复如此，把日志发出来",
-            )
-        }
+        // 退避、互斥、令牌作废全部交给 scheduleConnectRetry（建链失败也走同一条路）。
+        // 以前这里另有一套 3/6/12/24 秒循环，与建链失败重试叠加成每 10~20 秒一轮的
+        // 重连风暴（MGU-81 日志 17:43~17:47）；两套必须合一。
+        scheduleConnectRetry("解冻后自动恢复（冻结 ${seconds}s）")
     }
 
     /** 恢复前把蓝牙组件拉起来（已运行则空操作）。真车/测试台两条路径都拉，判断交给组件自身。 */
@@ -2433,41 +2369,16 @@ object SessionController {
     private fun scheduleConnectRetry(reason: String) {
         if (connectCancelled || !sessionWanted || isStreaming()) return
         val target = lastSessionTarget ?: return
-        var delay = 0L
-        var attempt = 0
-        var generation = 0
-        synchronized(connectRetryLock) {
-            if (connectRetryScheduled) {
-                appendLog("RETRY: 已有一轮重试在排队——本次失败不再叠加")
-                return
-            }
-            if (connectRetryAttempt >= CONNECT_RETRY_BACKOFF_MS.size) {
-                appendLog(
-                    "RETRY: 已连续失败 ${connectRetryAttempt} 轮，停止自动重试——" +
-                        "请在车机上把 CarPlay 关掉再打开（或熄火重上电）后，手动点「启动连接」",
-                )
-                return
-            }
-            attempt = connectRetryAttempt
-            delay = CONNECT_RETRY_BACKOFF_MS[attempt]
-            connectRetryScheduled = true
-            // 令牌必须与「占用排队位」在同一把锁里取：分两步读时，中间若有用户点击/
-            // 车机邀请把令牌 +1，这一次退避就会把**新一轮**的令牌当成自己的，
-            // 醒来后判定「没过期」并再起一轮 —— 正是要避免的两轮并行交接。
-            generation = connectRetryGeneration
-        }
+        // 排队位、退避序号与作废令牌在同一把锁里一次性取到（见 ReconnectGate）
+        val reserved = reconnectGate.reserve(reason) ?: return
         Bg.run("connect-retry") {
             try {
                 appendLog(
-                    "RETRY: $reason——${delay / 1_000}s 后自动重试" +
-                        "（第 ${attempt + 1}/${CONNECT_RETRY_BACKOFF_MS.size} 次）",
+                    "RETRY: $reason——${reserved.delayMillis / 1_000}s 后自动重试" +
+                        "（第 ${reserved.attempt + 1}/${reconnectGate.maxAttempts} 次）",
                 )
-                sleepQuietly(delay)
-                val stale =
-                    synchronized(connectRetryLock) {
-                        connectRetryGeneration != generation
-                    }
-                if (stale) {
+                sleepQuietly(reserved.delayMillis)
+                if (reconnectGate.isStale(reserved)) {
                     appendLog("RETRY: 等待期间已有新一轮接手（车机邀请/用户操作）——本次重试作废")
                     return@run
                 }
@@ -2475,11 +2386,17 @@ object SessionController {
                     appendLog("RETRY: 条件已变（取消/正在连/已出画面）——跳过本次重试")
                     return@run
                 }
-                synchronized(connectRetryLock) { connectRetryAttempt = attempt + 1 }
-                appendLog("RETRY: 发起第 ${attempt + 1} 次自动重试（端点 ${target.endpoint.ssid}）")
-                onCarPlayEndpoint(target.endpoint, "建链失败自动重试 #${attempt + 1}", onCurrentWifi = target.onCurrentWifi)
+                reconnectGate.noteStarted(reserved)
+                appendLog("RETRY: 发起第 ${reserved.attempt + 1} 次自动重试（$reason · 端点 ${target.endpoint.ssid}）")
+                // 解冻恢复也走这里：重连前先确保 BT 监听还活着（已运行则空操作）
+                restartBluetoothForRecovery()
+                onCarPlayEndpoint(
+                    target.endpoint,
+                    "自动重试 #${reserved.attempt + 1}（$reason）",
+                    onCurrentWifi = target.onCurrentWifi,
+                )
             } finally {
-                synchronized(connectRetryLock) { connectRetryScheduled = false }
+                reconnectGate.finish()
             }
         }
     }
@@ -2512,21 +2429,12 @@ object SessionController {
             appendLog("CTRL: 车机邀请到达——本轮已有会话在处理中，交给它（不并行再起一轮）")
             return
         }
-        val exhausted =
-            synchronized(connectRetryLock) {
-                if (connectRetryAttempt >= CONNECT_RETRY_BACKOFF_MS.size) {
-                    true
-                } else {
-                    // 邀请打断退避：令牌 +1，挂在睡眠里的重试线程醒来就作废
-                    connectRetryGeneration++
-                    connectRetryScheduled = false
-                    false
-                }
-            }
+        // 邀请比退避计时器权威：令牌 +1，挂在睡眠里的旧重试醒来就作废
+        val exhausted = reconnectGate.invalidateForInvite()
         if (exhausted) {
             appendLog(
                 "CTRL: 车机仍在邀请（本轮共 ${ctrlAdvertiser?.inviteCount ?: 0} 次），" +
-                    "但已连续失败 ${CONNECT_RETRY_BACKOFF_MS.size} 轮——不再自动重连；" +
+                    "但已连续失败 ${reconnectGate.maxAttempts} 轮——不再自动重连；" +
                     "请重启车机侧 CarPlay 后手动点「启动连接」",
             )
             return
@@ -2843,11 +2751,7 @@ object SessionController {
         idleListening = false
         // 新一次点击 = 新的重试预算（上一轮用完的三次不该算到这一轮头上）；
         // 令牌 +1 让还在退避睡眠里的旧线程作废，避免与手动这一轮并行交接
-        synchronized(connectRetryLock) {
-            connectRetryAttempt = 0
-            connectRetryGeneration++
-            connectRetryScheduled = false
-        }
+        reconnectGate.reset("新一轮手动启动连接")
         // 新一轮 = 新的链路状态：上一轮丢过的 wlan0 不影响这一轮的判定
         wifiLinkLost = false
         wifiWatchdog?.start()
@@ -2994,11 +2898,7 @@ object SessionController {
         BtSessionGate.noteManualStop()
         // 用户终态同样作废排队中的自动重试——它醒来第一件事就是检查 sessionWanted，
         // 但先让令牌变一次，日志就能明确写出「用户已断开，本次重试作废」
-        synchronized(connectRetryLock) {
-            connectRetryGeneration++
-            connectRetryScheduled = false
-            connectRetryAttempt = 0
-        }
+        reconnectGate.reset("用户手动断开")
         SessionTrace.sessionEnd("用户手动断开")
         pendingEndpointUpdate = null
         retireSession()
@@ -3080,8 +2980,6 @@ object SessionController {
         Iap2RouteGuidance.reset()
         videoSender?.stop()
         videoSender = null
-        // 暗幕/常亮随会话收掉（本方法在每轮配对起步也会执行，新一轮推流起来后会重新置位）
-        ScreenDimmer.setSessionActive(false)
         audioSender?.stop()
         audioSender = null
         // 导航独立流（实验）随会话一起收：留着会在下一轮被当成「已建好」而跳过重建
@@ -3101,10 +2999,6 @@ object SessionController {
         rejectedCallProfileKey = null
         currentSharedSecret = null
         currentAudioHost = null
-        currentHiddenSource?.release()
-        currentHiddenSource = null
-        TouchRouter
-            .reset()
         // 本机应用态静默收尾（此刻会话正在拆，补发没人收，只会在日志里留一条发送失败）
         appStateReporter.stop(publishFinal = false)
         retired?.let {
@@ -3124,11 +3018,6 @@ object SessionController {
         // （2026-10-16 实测）。BT 退役只在用户终态做，见 disconnect()。
         // 解除会话静默：出站探测恢复（下次会话建立时会再次置位）
         BtSessionGate.sessionActive = false
-        // 「强制应用横屏」覆盖随会话结束统一复原（应用回到手机侧正常竖屏形态）。
-        // 异步：每应用两次 am compat shell 往返，6 个应用实测 ~1.6s；此前同步跑在
-        // 配对前，等于每次连接白等 1.6s（2026-10-18 实测）。执行器串行保证
-        // 「先复原上一会话、后写入本会话」的顺序。
-        appContext?.let { ctx -> AppOrientationCompat.resetAllAsync(ctx, ::appendLog) }
         // 协议一致性汇总：放在最后一行，拆链原因与问题清单一前一后，反馈日志时最上面、
         // 最下面各有一条结论，不用翻中间过程。
         flushProtocolAudit("会话退役")
@@ -4380,7 +4269,6 @@ object SessionController {
                     // 实验开关：保留视频流时**不能 detach**——采集端一连断开，编码器就没帧可送，
                     // 「不拆流」也就名存实亡。
                     if (!streamKept) CarLifeHijack.detach()
-                    ScreenDimmer.setSessionActive(false)
                     phaseHint =
                         if (streamKept) {
                             "车机暂时持有主屏资源——视频流保留，归还后立即恢复"
@@ -4424,7 +4312,6 @@ object SessionController {
                         CarLifeHijack.attach(sender, ::appendLog)
                         appendLog("RESOURCE: 主屏归还，已重新 SETUP/RECORD 并恢复视频（音频所有权独立）")
                     }
-                    ScreenDimmer.setSessionActive(true)
                     phaseHint = "主屏资源已归还，CarPlay 视频恢复"
                     startCarlifeWaitNotice()
                     startFirstFrameGate()
@@ -4436,6 +4323,9 @@ object SessionController {
         onAudioOwnership = { owned -> applyAudioOwnership(context, client, secret, owned) },
         onFailure = { reason -> endClientSession(client, reason) },
         log = ::appendLog,
+        canPlayNavigationAudio = {
+            navAudioSender?.isRunning == true || client.supportsAudioType(NAV_AUDIO_TYPE)
+        },
     )
 
     /**
@@ -6936,10 +6826,7 @@ object SessionController {
                                                 // 用户一般是先点一下列表再转旋钮，锚点跟着手走
                                                 // 比固定屏幕中心好用得多（见 KnobRouter）。
                                                 if (it.down) KnobRouter.noteTouch(it.xPixels, it.yPixels)
-                                                TouchRouter.onContact(
-                                                    context.applicationContext,
-                                                    it,
-                                                )
+                                                TouchRouter.onContact(it)
                                             }
                                         } else if (report != null) {
                                                 appendLog(
@@ -7193,24 +7080,11 @@ object SessionController {
                                     val sessionTargetFps = StreamFps.resolve(setup.maxFps)
                                     activeScalePercent = scalePct
                                     activeTargetFps = sessionTargetFps
-                                    // 合成器出帧节奏跟着走：attach 时按 60 建（那时还没
-                                    // SETUP），车机上限要到这一刻才知道。不同步的话
-                                    // 多出来的帧会白白送去编码再丢掉。
-                                    VirtualLauncher.setStreamFps(sessionTargetFps)
                                     // 记录「车机通告分辨率」原值：英雄卡与「显示」卡片要如实
                                     // 展示它，而不是只显示缩放百分比（用户根本看不出画布多大）。
                                     activeCarWidth = setup.displayWidth
                                     activeCarHeight = setup.displayHeight
                                     activeCarResolutionFromCar = setup.displayFromCar
-                                    // 车机触摸在通告视图坐标系（如 1160×540），流已按比例
-                                    // 缩放（如 1450×674）——注入前需映射，否则点击漂移
-                                    TouchRouter
-                                        .setCoordinateScale(
-                                            setup.displayWidth,
-                                            setup.displayHeight,
-                                            streamW,
-                                            streamH,
-                                        )
                                     // CarLife 劫持链路用自己的坐标映射（车机视图 → 手机视频），
                                     // 这里只需把车机通告的视图尺寸交给它
                                     CarLifeHijack.setViewSize(setup.displayWidth, setup.displayHeight)
@@ -7520,7 +7394,6 @@ object SessionController {
                                         // 于是「已回放画面」不会被误判成「没有 CarLife 画面」。
                                         videoSessionFrameBase = CarLifeHijack.framesDelivered
                                         CarLifeHijack.attach(target) { line -> appendLog(line) }
-                                        ScreenDimmer.setSessionActive(true)
                                         initialScreenAttached = true
                                     } else {
                                         appendLog("MODE: 数据端口未就绪，直通启动失败")
@@ -7682,7 +7555,7 @@ object SessionController {
                                 }
                             } else {
                                 // 起来了：重试计数归零，下次断链重新从 3s 起算
-                                synchronized(connectRetryLock) { connectRetryAttempt = 0 }
+                                reconnectGate.clearAttempt()
                             }
                         }
                     }

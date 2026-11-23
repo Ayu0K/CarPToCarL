@@ -140,6 +140,12 @@ class AirPlayClient(
     /** 会话级 RECORD 预算：默认允许重复；[restrictSingleRecord] 打开后只放行第一次。 */
     private val recordBudget = RecordBudget()
 
+    /** 首次 RECORD 完成的时刻（uptimeMillis）；0 = 本轮还没 RECORD。 */
+    @Volatile private var recordedAtMs: Long = 0L
+
+    /** 「Restoring LUM」初始接管只豁免一次，之后真让屏照常处理。 */
+    @Volatile private var initialScreenTakeoverIgnored = false
+
     /**
      * 本接收端对「会话激活后再发一次 RECORD」过敏（宝马 iD6 / NBT Evo、JYBOX-80）。
      *
@@ -1492,7 +1498,7 @@ class AirPlayClient(
             )
         }
         // 车机分辨率：`displays[].widthPixels/heightPixels`。宽容解析见 CarDisplayGeometry——
-        // 这里一旦静默落空，整条链路（流画布 / 虚拟屏 / CarLife 98311 / 触摸映射）就全部
+        // 这里一旦静默落空，整条链路（流画布 / CarLife 98311 / 触摸映射）就全部
         // 按手机分辨率跑，画面比例当场错，所以成功与失败都必须落一条日志。
         val carDisplay = selected?.let(CarDisplayGeometry::sizeOf)
         val fallbackDisplay = phoneFallbackSize()
@@ -2534,6 +2540,13 @@ class AirPlayClient(
     }
 
     private companion object {
+        /**
+         * RECORD 后多长内的 `Restoring LUM` 算「初始接管」而不是用户让屏（毫秒）。
+         * 宝马 MGU-81 实测 1~15ms 到达；2 秒留足慢车机的事件通道延迟，又不会把
+         * 用户随后切倒车影像的动作误吞。
+         */
+        const val INITIAL_TAKE_GRACE_MS = 2_000L
+
         /** 主屏视频流类型（对照接收端 STREAM_TYPE_MAIN_SCREEN；100 是音频、130 是数据/iAP 隧道）。 */
         const val SCREEN_STREAM_TYPE = 110L
 
@@ -3259,22 +3272,7 @@ class AirPlayClient(
         //
         // **单声道必须排在对应立体声之后但同率之前**：奥迪 101/default 只有 mono 位，
         // 排太靠后会让 44.1k 立体声先命中（多一次重采样，甚至位图里根本没有）。
-        val ordered =
-            listOf(
-                AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_48K_STEREO,
-                AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_48K_MONO,
-                AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_44K_STEREO,
-                AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_44K_MONO,
-                AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_AAC_48K_STEREO,
-                AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_AAC_LC_44K_STEREO,
-                AUDIO_STREAM_TYPE to AUDIO_FORMAT_PCM_48K_STEREO,
-                AUDIO_STREAM_TYPE to AUDIO_FORMAT_PCM_48K_MONO,
-                AUDIO_STREAM_TYPE to AUDIO_FORMAT_PCM_44K_STEREO,
-                AUDIO_STREAM_TYPE to AUDIO_FORMAT_PCM_44K_MONO,
-                AUDIO_STREAM_TYPE to AUDIO_FORMAT_AAC_48K_STEREO,
-                AUDIO_STREAM_TYPE to AUDIO_FORMAT_AAC_LC_44K_STEREO,
-            )
-        val hit = pickDeclaredFormat(declared, wanted, ordered)
+        val hit = pickDeclaredFormat(declared, wanted, audioTypeFormatOrder())
         if (hit == null) {
             val declaredTypes = declared.mapNotNull { (it["audioType"] as? String)?.lowercase() }.distinct()
             if (wanted in declaredTypes) {
@@ -3324,6 +3322,39 @@ class AirPlayClient(
         log("AIRPLAY: audioType=$wanted 档可用 → ${profile.label}")
         return profile
     }
+
+    /**
+     * 车机 `/info` 是否为指定 [audioType] 声明了本端可发送的音频档位（无日志副作用）。
+     *
+     * 供资源仲裁层在借用主音频前确认「导航独立流是否可能建起来」：例如车机 101/default 仅声明
+     * Opus（当前未实现编码器）时返回 false，避免借用主音频把原车音源掐成静音却发不出导航声。
+     */
+    fun supportsAudioType(audioType: String): Boolean {
+        val wanted = audioType.trim().lowercase()
+        if (wanted.isEmpty()) return false
+        val info = negotiatedInfo ?: return false
+        val declared =
+            (info["audioFormats"] as? List<*>)
+                ?.mapNotNull { it as? Map<*, *> }
+                .orEmpty()
+        return pickDeclaredFormat(declared, wanted, audioTypeFormatOrder()) != null
+    }
+
+    private fun audioTypeFormatOrder(): List<Pair<Long, Long>> =
+        listOf(
+            AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_48K_STEREO,
+            AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_48K_MONO,
+            AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_44K_STEREO,
+            AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_44K_MONO,
+            AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_AAC_48K_STEREO,
+            AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_AAC_LC_44K_STEREO,
+            AUDIO_STREAM_TYPE to AUDIO_FORMAT_PCM_48K_STEREO,
+            AUDIO_STREAM_TYPE to AUDIO_FORMAT_PCM_48K_MONO,
+            AUDIO_STREAM_TYPE to AUDIO_FORMAT_PCM_44K_STEREO,
+            AUDIO_STREAM_TYPE to AUDIO_FORMAT_PCM_44K_MONO,
+            AUDIO_STREAM_TYPE to AUDIO_FORMAT_AAC_48K_STEREO,
+            AUDIO_STREAM_TYPE to AUDIO_FORMAT_AAC_LC_44K_STEREO,
+        )
 
     /**
      * **通话音频**档位候选（`audioType=telephony`，2026-10-29 适配）。
@@ -3714,6 +3745,7 @@ class AirPlayClient(
                 )
             // 报文确实发出去了（拿到应答，不论状态码）：记进预算，后续不再补发。
             recordBudget.noteSent()
+            if (recordedAtMs == 0L) recordedAtMs = SystemClock.uptimeMillis()
             val ok = statusLine.contains("200")
             log(if (ok) "AIRPLAY: ✓ RECORD 完成——会话已激活" else "AIRPLAY: RECORD 应答 [$statusLine]")
             ok
@@ -3899,13 +3931,22 @@ class AirPlayClient(
                             val reply =
                                 if (command["type"] == "changeModes") {
                                     val changeParams = command["params"] as? Map<*, *>
-                                    audioTransfer = resourceState.applyCarChange(changeParams)
+                                    val sinceRecord =
+                                        if (recordedAtMs == 0L) Long.MAX_VALUE
+                                        else SystemClock.uptimeMillis() - recordedAtMs
+                                    val initialRestore =
+                                        !initialScreenTakeoverIgnored &&
+                                            AirPlayResourceState.isInitialRestoreReason(changeParams) &&
+                                            sinceRecord in 0L..INITIAL_TAKE_GRACE_MS
+                                    if (initialRestore) initialScreenTakeoverIgnored = true
+                                    audioTransfer = resourceState.applyCarChange(changeParams, initialRestore)
                                     // 两行：①人读的状态（谁持有、借用者是谁）；②报文原文（含所有
                                     // 未知字段）。reasonStr 在别克 6369 上恒为空串，只能靠原文里
                                     // 的 borrowID / transferType / 约束值来判断车机在干什么。
                                     log(
                                         "EVENT: changeModes reasonStr=" +
                                             AirPlayResourceState.reasonText(changeParams) +
+                                            (if (initialRestore) " [初始接管豁免：RECORD 后 ${sinceRecord}ms，不拆屏流]" else "") +
                                             " " + resourceState.describe(),
                                     )
                                     log("EVENT: changeModes 原文=" + AirPlayResourceState.paramsText(changeParams))
