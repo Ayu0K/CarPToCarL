@@ -680,8 +680,9 @@
                 </LinearLayout>
 
                 <!-- 启用 CarLife 媒体歌词（fork 专属开关）：
-                     开 = 标题/歌手从 CarLife 0x10035 读（歌词行即逐行歌词）；封面始终从系统 MediaSession 读
-                     关 = 标题/歌手/封面始终从系统 MediaSession 读真实值。 -->
+                     开 = title=CarLife歌词 / artist=系统歌名 / album=系统歌手
+                     关 = title=系统歌名 / artist=系统歌手 / album=CarLife专辑
+                     封面两种状态都从系统 MediaSession 读。 -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -710,7 +711,7 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="2dp"
-                            android:text="开启：标题/歌手取 CarLife 歌词；封面始终取系统媒体会话"
+                            android:text="开：歌词/系统歌名/系统歌手；关：歌名/歌手/CarLife专辑"
                             android:textColor="@color/m3_on_var"
                             android:textSize="11.5sp" />
                     </LinearLayout>
