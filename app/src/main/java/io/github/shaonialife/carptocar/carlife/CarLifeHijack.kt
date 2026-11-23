@@ -1759,7 +1759,10 @@ object CarLifeHijack {
         }
         // 歌词行不覆盖「真实歌名」基线：它是判断「MediaSession 与 CarLife 是否同一首歌」
         // 的唯一凭据（见 NowPlayingSourcePolicy），被歌词顶掉就再也判不出来了。
-        if (!LyricLines.isLyricLine(info)) latestSongMediaInfo = info
+        // 占位歌词（「纯音乐，请欣赏」）例外：它仍携带当前曲目的专辑/时长，允许更新基线。
+        val session = MediaSessionsState.nowPlaying
+        val lyric = LyricLines.isLyricLine(info, session?.title, session?.artist)
+        if (!lyric || LyricLines.isPlaceholder(info.song)) latestSongMediaInfo = info
         latestMediaInfo = info
         latestMediaInfoAtMillis = android.os.SystemClock.uptimeMillis()
         mediaInfoListeners.forEach { runCatching { it(info) } }

@@ -8,10 +8,10 @@ import android.content.Context
  * **封面不参与切换，始终从系统 MediaSession 获取。**
  *
  * 两种取值：
- *  - [Source.CARLIFE]（开）：`title` = CarLife 0x10035 的 `song`（逐行歌词），
- *    `artist` = 系统 MediaSession 的歌名，`album` = MediaSession 的歌手名。
- *    车机三行依次显示「歌词 / 歌名 / 歌手」；系统会话缺席时后两行留空，不回退
- *    CarLife 的 `artist`（歌词行里是「歌名-歌手」拼接串）。
+ *  - [Source.CARLIFE]（开）：有歌词时 `title` = CarLife 的当前歌词（`song`），
+ *    `artist` / `album` = 从 CarLife `artist`（形如「歌名-歌手」）拆出的真实歌名 / 歌手；
+ *    无歌词或占位歌词（「纯音乐，请欣赏」）时回退系统 MediaSession 的歌名 / 歌手，
+ *    `album` 仍取 CarLife 的专辑名。车机三行因此始终有完整内容。
  *  - [Source.MEDIA_SESSION]（关）：`title` / `artist` 取系统 MediaSession 的真实
  *    歌名 / 歌手；`album` 取 CarLife 0x10035 的专辑名（MediaSession 没有专辑字段）。
  *

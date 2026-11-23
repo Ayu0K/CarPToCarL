@@ -680,8 +680,9 @@
                 </LinearLayout>
 
                 <!-- 启用 CarLife 媒体歌词（fork 专属开关）：
-                     开 = title=CarLife歌词 / artist=系统歌名 / album=系统歌手
-                     关 = title=系统歌名 / artist=系统歌手 / album=CarLife专辑
+                     开 = 歌词行：title=歌词 / artist=CarLife歌名 / album=CarLife歌手；
+                          无歌词或占位歌词：回退系统歌名/歌手，album=CarLife专辑。
+                     关 = title/artist=系统歌名/歌手，album=CarLife专辑。
                      封面两种状态都从系统 MediaSession 读。 -->
                 <LinearLayout
                     android:layout_width="match_parent"
@@ -711,7 +712,7 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="2dp"
-                            android:text="开：歌词/系统歌名/系统歌手；关：歌名/歌手/CarLife专辑"
+                            android:text="开：歌词/歌名/歌手优先 CarLife，无歌词回退系统；关：系统歌名/歌手+CarLife专辑"
                             android:textColor="@color/m3_on_var"
                             android:textSize="11.5sp" />
                     </LinearLayout>

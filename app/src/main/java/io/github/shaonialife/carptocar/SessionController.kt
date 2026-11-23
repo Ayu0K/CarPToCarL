@@ -47,6 +47,7 @@ import io.github.shaonialife.carptocar.iap2.Iap2RouteGuidance
 import io.github.shaonialife.carptocar.iap2.Iap2SenderSession
 import io.github.shaonialife.carptocar.iap2.NmeaAssembler
 import io.github.shaonialife.carptocar.iap2.NmeaLocation
+import io.github.shaonialife.carptocar.iap2.NowPlayingFieldPolicy
 import io.github.shaonialife.carptocar.iap2.ReceiverProfile
 import io.github.shaonialife.carptocar.input.ConsumerKeys
 import io.github.shaonialife.carptocar.input.HidDescriptorSummary
@@ -672,7 +673,13 @@ object SessionController {
         // 数据源 A：CarLife 内置播放器（0x10035）——兜底，仅其内置播放器会推。
         // 逐行歌词也走这条（`artist == "<专辑>-<画家>"`），日志里单独标出来。
         CarLifeHijack.addMediaInfoListener { info ->
-            val kind = if (LyricLines.isLyricLine(info)) "歌词行" else "歌名"
+            val session = MediaSessionsState.nowPlaying
+            val kind =
+                when {
+                    LyricLines.isPlaceholder(info.song) -> "占位歌词"
+                    LyricLines.isLyricLine(info, session?.title, session?.artist) -> "歌词行"
+                    else -> "歌名"
+                }
             appendLog(
                 "EVENT: CarLife $kind「${info.song}」→ 补推 iAP2 0x5001 NowPlayingUpdate",
             )
@@ -1027,24 +1034,29 @@ object SessionController {
     }
 
     /**
-     * CarLife 推来的专辑名：优先最近一条**非歌词行**（真实歌曲），歌词行兜底。
+     * CarLife 推来的专辑名：当前帧优先，其次最近一条**非歌词行**（真实歌曲），歌词行兜底。
      *
-     * 系统 MediaSession 的 metadata 没有单独暴露专辑字段，所以开关关闭时用它补 0x5001
-     * 的 album；歌词行的 album 与真实歌曲相同，兜底不会串成「歌名-歌手」那种拼接串。
+     * 系统 MediaSession 的 metadata 没有单独暴露专辑字段，所以 0x5001 的 album 用它补：
+     * 开关关闭时补 MediaSession 的歌名/歌手，开关开启但无歌词时也用它。
      */
-    private fun carLifeAlbum(): String? =
-        (CarLifeHijack.latestSongMediaInfo?.album ?: CarLifeHijack.latestMediaInfo?.album)
-            ?.takeIf { it.isNotBlank() }
+    private fun carLifeAlbum(current: CarLifeMediaInfo? = null): String? =
+        listOfNotNull(
+            current?.album,
+            CarLifeHijack.latestSongMediaInfo?.album,
+            CarLifeHijack.latestMediaInfo?.album,
+        ).firstOrNull { it.isNotBlank() }?.trim()
 
     /**
      * 构造 iAP2 0x5001 载荷。
      *
      * **字段映射由 [NowPlayingTextSourcePrefs] 决定**（fork 开关，对齐真 iPhone 的三行排版）：
-     *  - **开（启用 Carlife 媒体歌词）**：title = CarLife `song`（歌词行即逐行歌词），
-     *    artist = 系统 MediaSession 的歌名（真实歌曲名），album = MediaSession 的歌手名。
-     *    即把「歌词 / 歌名 / 歌手」依次塞进 iAP2 的 title / artist / album 三个字段。
+     *  - **开（启用 Carlife 媒体歌词）**：有歌词时 title = CarLife `song`（逐行歌词），
+     *    artist / album = 系统 MediaSession 的完整歌名 / 歌手（旧实现，实车验证与 iPhone
+     *    一致）；会话读不到时才从 CarLife `artist`（形如「歌名-歌手」）拆出歌名 / 歌手兜底。
+     *    无歌词或占位歌词（如「纯音乐，请欣赏」）时回退 MediaSession 的歌名 / 歌手，
+     *    album 仍取 CarLife 专辑名。详见 [NowPlayingFieldPolicy]。
      *  - **关**：title / artist 均取系统 MediaSession 的真实歌名 / 真实歌手；album 取
-     *    CarLife 0x10035 的专辑名（优先最近一条非歌词行，歌词行兜底）。
+     *    CarLife 0x10035 的专辑名（当前帧优先，其次最近一条非歌词行）。
      *
      * **封面不受开关影响**：始终从系统 MediaSession（`MediaSessionsState.nowPlaying?.art`）
      * 获取，CarLife 的 `albumArt` 一概不读，沿用原本的位图身份去重与 iAP2 传输链路。
@@ -1100,12 +1112,13 @@ object SessionController {
     /**
      * CarLife 侧（0x10035）的 0x5001 载荷（开关「启用 Carlife 媒体歌词」打开时专用）。
      *
-     * **title = `info.song`**（歌词行即逐行歌词）；
-     * **artist = 系统 MediaSession 的 title**（真实歌曲名）；
-     * **album = 系统 MediaSession 的 artist**（真实歌手）。
-     * 车机三行依次显示「歌词 / 歌名 / 歌手」，与真 iPhone 的 Now Playing 布局一致。
-     * 系统会话缺席时 artist / album 留空，**不回退** CarLife 的 `artist`（歌词行里是
-     * 「歌名-歌手」拼接串，塞进 artist 会破坏这个排布）。
+     * 有歌词：title = `info.song`（逐行歌词），artist / album = 系统 MediaSession 的
+     * 完整歌名 / 歌手（旧实现，实车验证与 iPhone 一致，保留标题里播放器追加的翻译/备注）；
+     * 系统会话读不到时才从 `info.artist`（形如「歌名-歌手」）拆出歌名 / 歌手兜底。
+     *
+     * 无歌词（三个字段一一对应）或占位歌词（「纯音乐，请欣赏」「暂无歌词」）：
+     * 回退 MediaSession 的真实歌名 / 歌手，album 仍取 CarLife 的专辑名。具体取舍见
+     * [NowPlayingFieldPolicy]。
      *
      * duration 仍取「最近一条非歌词行」的真实歌曲那条（歌词行 duration 常为 0）。
      *
@@ -1118,14 +1131,21 @@ object SessionController {
         session: MediaSessionsState.NowPlaying?,
         includeArtwork: Boolean,
     ): CarPlayNowPlaying {
-        val lyric = LyricLines.isLyricLine(info)
+        val lyric = LyricLines.isLyricLine(info, session?.title, session?.artist)
         val source = if (lyric) base else null
         // 时长用真实歌曲那条，与歌词行字段的选择解耦；封面完全不用 CarLife 数据。
         val duration = source?.duration?.takeIf { it > 0 } ?: info.duration
+        val fields =
+            NowPlayingFieldPolicy.carLife(
+                info = info,
+                sessionTitle = session?.title,
+                sessionArtist = session?.artist,
+                carLifeAlbum = carLifeAlbum(info),
+            )
         return CarPlayNowPlaying(
-            title = info.song.takeIf { it.isNotBlank() },
-            artist = session?.title?.takeIf { it.isNotBlank() },
-            album = session?.artist?.takeIf { it.isNotBlank() },
+            title = fields.title,
+            artist = fields.artist,
+            album = fields.album,
             durationMs = duration,
             status = Iap2NowPlaying.STATUS_PLAYING, // CarLife 推歌名即视为播放中
             // 必须是真实位置：填 0 时车机「已播放」永远停在 0:00、进度条一动不动。

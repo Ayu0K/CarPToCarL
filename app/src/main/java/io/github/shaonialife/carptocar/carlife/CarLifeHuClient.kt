@@ -1015,10 +1015,15 @@ class CarLifeHuClient(
                 }
                 infos.forEach { info ->
                     // 歌词行也要打出来（带标记）：日志里能直接看出「歌词通道到底通没通」，
-                    // 否则只能靠 artist 里那个诡异的 "<专辑>-" 前缀去猜。
-                    val lyric = LyricLines.isLyricLine(info)
+                    // 否则只能靠 artist 里那个诡异的 "<歌名>-" 前缀去猜。
+                    val tag =
+                        when {
+                            LyricLines.isPlaceholder(info.song) -> "（占位歌词）"
+                            LyricLines.isLyricLine(info) -> "（歌词行）"
+                            else -> ""
+                        }
                     log(
-                        "CARLIFE: 媒体信息${if (lyric) "（歌词行）" else ""} song=${info.song} " +
+                        "CARLIFE: 媒体信息$tag song=${info.song} " +
                             "artist=${info.artist} album=${info.album} dur=${info.duration}ms " +
                             "mode=${info.mode} art=${info.albumArt?.size ?: 0}B",
                     )
