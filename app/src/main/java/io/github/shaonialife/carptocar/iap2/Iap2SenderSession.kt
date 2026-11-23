@@ -121,6 +121,14 @@ class Iap2SenderSession(
     private var receiverIdentity: String = ""
 
     /**
+     * 从 0xAA01 证书识别出的首选 MFi 挑战长度（协议核 OID 规则，见 [MfiCertificateLength]）。
+     *
+     * null = 没识别到 / 还没收到证书 → 沿用原「记忆重排 + 逐档试探」。
+     * 识别结果**只插到队首**，失败后仍按原顺序试探，不是硬指定。
+     */
+    private var mfiRecognizedLength: Int? = null
+
+    /**
      * 本轮 0x4300 用的报文体形态。
      *
      * null = 不启用试错阶梯（没有 Context：单测/纯 JVM），一律用新版嵌套体，行为与
@@ -618,6 +626,17 @@ class Iap2SenderSession(
         }
         val certificate = expect(Iap2MessageIds.MFI_CERTIFICATE, deadline)
         log("iap2 rx=0xaa01 certificate bytes=${certificate.body.size}（跳过校验）")
+        // 协议核逆向回灌：先从证书扩展区的 Apple OID 识别首选长度（零试探）。
+        // 识别不出就保持 null，runMfiChallenge 完全走原来的基线+记忆试探。
+        val certDer =
+            Iap2Csm.parseParams(certificate.body).firstOrNull { it.id == 0 && it.value.isNotEmpty() }?.value
+                ?: certificate.body
+        mfiRecognizedLength = MfiCertificateLength.recognize(certDer)
+        if (mfiRecognizedLength != null) {
+            log("iap2 MFi 证书识别 → 首选 ${mfiRecognizedLength}B（协议核 OID 规则；失败自动回退试探）")
+        } else {
+            log("iap2 MFi 证书未识别到长度——按原基线+记忆逐档试探")
+        }
         // 挑战长度按接收端身份选择（2026-10-11 奥迪字节级实测修正）：
         //  - 真车系（Audi/Delphi MIB 等）：**20B 首试**。真 iPhone 实录（carplay-wifi-extractor
         //    client）与 catplay 发送端都用 20B；奥迪对 20B 秒答。32B 先行会导致车机
@@ -1792,6 +1811,10 @@ class Iap2SenderSession(
      * 顺序**以按车机持久化的记忆为准**（[MfiLengthMemory]，基线只作冷启动与兜底）：
      * 2026-10-19 奥迪 MMI 0000 实测 20B 静默 6 秒、32B 0.64 秒应答——只靠基线
      * 「真车都 20B 优先」每次连接都白等 6 秒。记忆命中后直接把上次成功的长度排第一。
+     *
+     * 2026-11-22 起，若 [mfiRecognizedLength] 已由证书识别得出（协议核 OID 规则），
+     * 它只**插到队首**，失败后仍按上面这套顺序逐档退路——识别是加速，不是硬指定。
+     *
      * 全部无应答时不抛异常直接返回——我们跳过签名校验，由后续 0x5702 是否获得应答
      * 判定对端是否放行（真车实测无应答后 0xaa05 仍可推进）。
      */
@@ -1808,8 +1831,15 @@ class Iap2SenderSession(
             }
         val windowOf = MFI_ATTEMPTS.associate { it.first to it.second }
         val memory = MfiLengthMemory.load(context, receiverKey)
-        val order = MfiLengthMemory.orderAttempts(baselineLengths, memory)
-        if (!memory.isEmpty) {
+        val baselineOrder = MfiLengthMemory.orderAttempts(baselineLengths, memory)
+        // 证书识别只插队首，原顺序（记忆 + 基线）完整保留为失败后的退路。
+        val order = MfiCertificateLength.prefer(baselineOrder, mfiRecognizedLength)
+        if (order != baselineOrder) {
+            log(
+                "iap2 MFi 证书识别 ${mfiRecognizedLength}B → 本轮顺序 ${order.joinToString("/")}B" +
+                    "（识别仅做首选，失败后照后续档位试探）",
+            )
+        } else if (!memory.isEmpty) {
             log(
                 "iap2 MFi 按车机记忆（$receiverKey）：${MfiLengthMemory.describe(memory)}" +
                     " → 本轮顺序 ${order.joinToString("/")}B",
@@ -2297,8 +2327,13 @@ class Iap2SenderSession(
             Iap2CapabilityReport.report(log, "iap2 0x1d01 ", "可收清单", receives, isReceiveList = true)
             if (AccessoryDeclaration.acceptsRouteGuidance() == true) {
                 log(
-                    "iap2 0x1d01 ★ 车机声明接受导航引导(0x52xx) → 收到 0x5200 订阅会回 " +
-                        "0x5201 空态保住控制通道；maneuver 数据源未接入，暂不主动推导航报文",
+                    "iap2 0x1d01 ★ 车机声明接受导航引导(0x52xx) → 0x5200 订阅回 0x5201" +
+                        "（CarLife 有诱导时为真载荷，否则空态），并按需补推 0x5202 + 心跳",
+                )
+            } else if (Iap2RouteGuidance.blockedByDeclaration()) {
+                log(
+                    "iap2 0x1d01 ★ 车机可收清单无导航引导(0x52xx)" +
+                        " → 明确不发送 0x5201/0x5202（含 0x5200 订阅应答与 10s 心跳）",
                 )
             }
             // 车机画像（信号收口点）：身份 + 双清单 + 组件声明 → era/wifiGen 一行判定，

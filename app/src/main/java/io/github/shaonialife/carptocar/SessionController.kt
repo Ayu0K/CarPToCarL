@@ -703,6 +703,15 @@ object SessionController {
                     "raw=${info.rawNextTurn} → ${CarLifeNaviGuide.label(info.nextTurn)}" +
                     "(${info.nextTurn}) · ${info.roadName} · " +
                     "${info.remainDistance}m / ${info.totalDistance}m"
+            // 车机可收清单明确无 0x52xx 时一律不发送：连订阅应答、主动帧、心跳都不发。
+            // 清单未到（null）仍按未知放行，与「清单只能证明有、不能证明没有」的长期判据一致。
+            if (Iap2RouteGuidance.blockedByDeclaration()) {
+                appendLog(
+                    "EVENT: CarLife 导航诱导 $detail → 车机可收清单无 0x52xx" +
+                        "（不支持 iAP2 导航引导）→ 明确不发送 0x5201/0x5202，也不启心跳",
+                )
+                return@addNaviNextTurnListener
+            }
             val effect =
                 if (ending) "同步补推 iAP2 0x5201 清除帧并停止心跳"
                 else "补推 iAP2 0x5201/0x5202 + 启动 10s 心跳"
@@ -4522,6 +4531,14 @@ object SessionController {
                 appendLog("AUDIO: 直通模式——PCM 档优先，AAC 仅作兜底")
             }
             ordered = pcmFirst
+            val beforeMediaGuard = ordered
+            ordered = AudioProfileMemory.prioritizeMedia48k(ordered, entry.rejected)
+            if (ordered.firstOrNull()?.key != beforeMediaGuard.firstOrNull()?.key && ordered.isNotEmpty()) {
+                appendLog(
+                    "AUDIO: 选档加固——未被否掉的 t100/media PCM48k 已提到 compatibility 之前" +
+                        "（避免接收端把媒体流按 realtime 100ms 缓冲）",
+                )
+            }
             if (ordered.isEmpty()) {
                 appendLog("AUDIO: 没有可用音频档位（候选=${candidates.map { it.label }}）——仅推视频")
                 return false
